@@ -55,11 +55,18 @@ def _parse_refund_value(text: str) -> float:
 
 def get_order_id(page) -> str:
     """
-    Extract the actual Shopee Order ID from an Order Details page.
+    Extract ONLY the actual Shopee Order ID from an Order Details page.
 
-    Example element text:
+    Regular order:
         Order ID
         260822184N9XJB
+
+    Advance-booking order:
+        Order ID
+        2609020K9YKJ9H
+        (Booking ID: 260831AASREZS5CLKRU)
+
+    The Booking ID is intentionally ignored.
     """
 
     element = page.get_by_test_id(
@@ -68,23 +75,68 @@ def get_order_id(page) -> str:
 
     element.wait_for(
         state="visible",
-        timeout=DEFAULT_TIMEOUT
+        timeout=DEFAULT_TIMEOUT,
     )
 
-    text = element.inner_text().strip()
+    # Prefer the Order ID card's body so the "Order ID" heading itself
+    # is not mixed into the value.
+    body = element.locator(
+        ".body"
+    ).first
+
+    if body.count() > 0:
+        body_text = body.inner_text().strip()
+
+        # Advance-booking orders append:
+        #   (Booking ID: XXXXXXXXX)
+        # Remove only that optional suffix. Regular orders are unchanged.
+        order_text = re.sub(
+            r"\s*\(\s*Booking\s+ID\s*:[^)]*\)\s*",
+            "",
+            body_text,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # The actual Order ID is the first non-space value remaining.
+        match = re.match(
+            r"^([A-Za-z0-9]+)",
+            order_text,
+        )
+
+        if match:
+            return match.group(1)
+
+    # Fallback for future/alternate Shopee layouts:
+    # inspect the whole card, but explicitly exclude the heading and
+    # any Booking ID line.
+    full_text = element.inner_text().strip()
 
     lines = [
         line.strip()
-        for line in text.splitlines()
+        for line in full_text.splitlines()
         if line.strip()
     ]
 
-    if len(lines) < 2:
-        raise ValueError(
-            f"Could not extract Order ID from {text!r}"
+    candidates = [
+        line
+        for line in lines
+        if line.lower() != "order id"
+        and "booking id" not in line.lower()
+    ]
+
+    for candidate in candidates:
+        match = re.match(
+            r"^([A-Za-z0-9]+)",
+            candidate,
         )
 
-    return lines[-1]
+        if match:
+            return match.group(1)
+
+    raise ValueError(
+        f"Could not extract Shopee Order ID from {full_text!r}"
+    )
+
 
 
 def get_returned_products(page) -> list[dict]:
