@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+
+# Local browser/login profiles
+OdooProfile/
+ChromeProfile/
+
+# Local app data
+*.log
+
+# VS Code local settings
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Release packages
+MakerlabReturnProcessor_*.zip

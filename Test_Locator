@@ -1,0 +1,88 @@
+from playwright.sync_api import Playwright, sync_playwright
+
+from shopee import (
+    get_order_id,
+    get_returned_product_count,
+    get_returned_product_skus,
+    get_returned_products
+)
+
+
+PROFILE = r"C:\PlaywrightPAD\OdooProfile"
+
+ORDER_URL = (
+    "https://seller.shopee.ph/portal/sale/order/"
+    "240199627215293"
+)
+
+
+def run(playwright: Playwright) -> None:
+
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir=PROFILE,
+        channel="chrome",
+        headless=False,
+        no_viewport=True
+    )
+
+    page = context.pages[0]
+
+    page.goto(
+        ORDER_URL,
+        wait_until="domcontentloaded"
+    )
+
+    # =====================================================
+    # ORDER ID
+    # =====================================================
+
+    order_id = get_order_id(page)
+
+    print("\nORDER ID:")
+    print(order_id)
+
+    # =====================================================
+    # RETURNED PRODUCT COUNT
+    # =====================================================
+
+    returned_count = get_returned_product_count(page)
+
+    print("\nRETURNED PRODUCTS:")
+    print(returned_count)
+
+    # =====================================================
+    # RETURNED SKUS
+    # =====================================================
+
+    returned_skus = get_returned_product_skus(page)
+
+    print("\nRETURNED SKUS:")
+
+    for sku in returned_skus:
+        print(sku)
+
+    # =====================================================
+    # SKU + RETURN QUANTITY
+    # =====================================================
+
+    returned_products = get_returned_products(page)
+
+    print("\nRETURNED PRODUCT DATA:")
+
+    for product in returned_products:
+        print(
+            f"SKU: {product['sku']} | "
+            f"QTY: {product['quantity']}"
+        )
+
+    # =====================================================
+    # DO NOT CLOSE UNTIL EVERYTHING ABOVE IS FINISHED
+    # =====================================================
+
+    input("\nPress ENTER to close...")
+
+    context.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
