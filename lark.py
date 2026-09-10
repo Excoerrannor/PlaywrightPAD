@@ -255,19 +255,20 @@ def file_lark_return(
     }
 
 
-def _index_returned_products(
+def _build_returned_item_pool(
     returned_products: list[dict],
-) -> dict[str, dict]:
+) -> list[dict]:
     """
-    Build an exact SKU -> GUI/Shopee item map.
+    Build a quantity-aware pool of confirmed returned-item rows.
 
-    main.py already prevents duplicate SKUs, so one SKU corresponds to
-    one returned-product record.
+    Duplicate SKUs are allowed because separate physical units of the same
+    SKU may have different Classification / Decision / Status and therefore
+    belong to different Odoo Transfer IDs.
     """
 
-    by_sku = {}
+    pool = []
 
-    for item in returned_products:
+    for index, item in enumerate(returned_products):
         sku = str(
             item.get("sku", "")
         ).strip()
@@ -277,26 +278,97 @@ def _index_returned_products(
                 "A returned product has a blank SKU."
             )
 
-        if sku in by_sku:
+        try:
+            quantity = int(
+                item.get("quantity", 0)
+            )
+        except (TypeError, ValueError) as error:
             raise ValueError(
-                f"Duplicate returned SKU: {sku}"
+                f"Invalid QTY for {sku}."
+            ) from error
+
+        if quantity <= 0:
+            raise ValueError(
+                f"QTY for {sku} must be at least 1."
             )
 
-        by_sku[sku] = item
+        pool.append(
+            {
+                "index": index,
+                "item": item,
+                "remaining": quantity,
+            }
+        )
 
-    return by_sku
+    return pool
 
 
-def _items_for_transfer(
+def _pool_item_matches_transfer(
+    item: dict,
+    *,
+    sku: str,
+    decision: str,
+    classification: str,
+    status: str,
+) -> bool:
+    """
+    Match one GUI/Shopee row to the Odoo transfer that it created.
+
+    The transfer group already records Decision + Classification + Status,
+    so those fields disambiguate duplicate SKU rows safely.
+    """
+
+    if str(
+        item.get("sku", "")
+    ).strip() != sku:
+        return False
+
+    if decision and str(
+        item.get("decision", "")
+    ).strip() != decision:
+        return False
+
+    if classification and str(
+        item.get("classification", "")
+    ).strip() != classification:
+        return False
+
+    if status and str(
+        item.get("status", "")
+    ).strip() != status:
+        return False
+
+    return True
+
+
+def _take_items_for_transfer(
     transfer: dict,
-    returned_by_sku: dict[str, dict],
+    returned_pool: list[dict],
 ) -> list[dict]:
     """
-    Rehydrate the item-level GUI data for the SKUs contained in one
-    Odoo transfer.
+    Consume the exact item quantities represented by one Odoo Transfer ID.
+
+    This supports cases such as:
+
+        MLE03495 | 1 | Unsealed  -> TC/IN/AAAA
+        MLE03495 | 1 | Defective -> TC/IN/BBBB
+
+    even though both rows have the same SKU.
     """
 
-    items = []
+    decision = str(
+        transfer.get("decision", "")
+    ).strip()
+
+    classification = str(
+        transfer.get("classification", "")
+    ).strip()
+
+    status = str(
+        transfer.get("status", "")
+    ).strip()
+
+    matched_items = []
 
     for transfer_item in transfer.get(
         "items",
@@ -306,27 +378,71 @@ def _items_for_transfer(
             transfer_item.get("sku", "")
         ).strip()
 
-        item = returned_by_sku.get(
-            sku
-        )
-
-        if not item:
+        try:
+            needed = int(
+                transfer_item.get("quantity", 0)
+            )
+        except (TypeError, ValueError) as error:
             raise ValueError(
-                f"Could not match Odoo Transfer item {sku} "
-                "back to the confirmed returned-product list."
+                f"Invalid Odoo transfer QTY for {sku}."
+            ) from error
+
+        if not sku or needed <= 0:
+            raise ValueError(
+                "Odoo transfer contains an invalid SKU/QTY row."
             )
 
-        items.append(
-            item
-        )
+        for entry in returned_pool:
+            if needed <= 0:
+                break
 
-    if not items:
+            if entry["remaining"] <= 0:
+                continue
+
+            item = entry["item"]
+
+            if not _pool_item_matches_transfer(
+                item,
+                sku=sku,
+                decision=decision,
+                classification=classification,
+                status=status,
+            ):
+                continue
+
+            allocated = min(
+                entry["remaining"],
+                needed,
+            )
+
+            # Use a shallow copy because the Lark representation may need
+            # only part of a GUI row's quantity.
+            allocated_item = dict(
+                item
+            )
+            allocated_item["quantity"] = allocated
+
+            matched_items.append(
+                allocated_item
+            )
+
+            entry["remaining"] -= allocated
+            needed -= allocated
+
+        if needed > 0:
+            raise ValueError(
+                f"Could not match {needed} remaining unit(s) of {sku} "
+                f"to Odoo Transfer {transfer.get('transfer_id', '')}. "
+                f"Expected handling: {classification} / {decision} / {status}."
+            )
+
+    if not matched_items:
         raise ValueError(
             f"Odoo Transfer {transfer.get('transfer_id', '')} "
             "contains no returned items."
         )
 
-    return items
+    return matched_items
 
 
 def _shared_item_field(
@@ -501,7 +617,7 @@ def file_lark_returns(
             "Shopee refunded/order value cannot be negative."
         )
 
-    returned_by_sku = _index_returned_products(
+    returned_pool = _build_returned_item_pool(
         returned_products
     )
 
@@ -536,9 +652,9 @@ def file_lark_returns(
                 "its Transfer ID or Transfer Link."
             )
 
-        items = _items_for_transfer(
+        items = _take_items_for_transfer(
             transfer,
-            returned_by_sku,
+            returned_pool,
         )
 
         # Prefer the values recorded by Odoo's return group itself.

@@ -247,7 +247,7 @@ class ReturnProcessorApp(tk.Tk):
             main_frame,
             text=(
                 "Returned Items — double-click SKU, QTY, or Amount to edit. "
-                "Select a row to edit its decision below."
+                "The same SKU may appear on multiple rows for different handling."
             ),
         ).grid(
             row=4,
@@ -1699,8 +1699,14 @@ class ReturnProcessorApp(tk.Tk):
                 "No returned items are loaded."
             )
 
-        seen_skus = set()
-
+        # Duplicate SKUs are intentionally allowed.
+        #
+        # Example:
+        #   MLE03495 | QTY 1 | Unsealed  | Refunded
+        #   MLE03495 | QTY 1 | Defective | Refunded
+        #
+        # These are two physical units of the same SKU that require
+        # different Odoo return/QC handling.
         for item in self.returned_products:
             sku = str(item.get("sku", "")).strip().upper()
 
@@ -1708,12 +1714,6 @@ class ReturnProcessorApp(tk.Tk):
                 raise ValueError(
                     "SKU cannot be blank."
                 )
-
-            if sku in seen_skus:
-                raise ValueError(
-                    f"Duplicate returned SKU: {sku}"
-                )
-            seen_skus.add(sku)
 
             try:
                 quantity = int(item.get("quantity", 0))

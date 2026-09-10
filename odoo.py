@@ -8,13 +8,40 @@ ODOO_COMMIT_BUFFER_MS = 700
 
 
 def build_ticket_title(order_id: str, returned_products: list[dict]) -> str:
-    """Build: ORDER ID - SKU_QTY, SKU_QTY, SKU_QTY..."""
+    """
+    Build: ORDER ID - SKU_QTY, SKU_QTY...
+
+    Duplicate SKU rows are combined in the ticket title only.
+
+    Example:
+        MLE03495_1 Unsealed
+        MLE03495_1 Defective
+
+    becomes:
+        ORDER ID - MLE03495_2
+
+    The item rows themselves remain separate so Odoo can still create
+    different Return / QC flows for each classification.
+    """
     if not returned_products:
         raise ValueError("At least one returned product is required.")
 
+    qty_by_sku = {}
+    sku_order = []
+
+    for item in returned_products:
+        sku = str(item["sku"]).strip()
+        quantity = int(item["quantity"])
+
+        if sku not in qty_by_sku:
+            qty_by_sku[sku] = 0
+            sku_order.append(sku)
+
+        qty_by_sku[sku] += quantity
+
     parts = [
-        f"{str(item['sku']).strip()}_{int(item['quantity'])}"
-        for item in returned_products
+        f"{sku}_{qty_by_sku[sku]}"
+        for sku in sku_order
     ]
 
     return f"{order_id} - " + ", ".join(parts)
