@@ -48,6 +48,11 @@ GRADES = [
     "D",
 ]
 
+RETURNED_STATUS = "Returned"
+NOT_RETURNED_STATUS = "Not Returned"
+DEFAULT_DECISION = "Disputed"
+PLATFORM = "Shopee"
+
 
 class ReturnProcessorApp(tk.Tk):
 
@@ -532,6 +537,10 @@ class ReturnProcessorApp(tk.Tk):
             sticky="ew",
             pady=4,
         )
+        self.return_status_combo.bind(
+            "<<ComboboxSelected>>",
+            self.on_status_changed,
+        )
 
         ttk.Label(
             self.item_frame,
@@ -768,6 +777,29 @@ class ReturnProcessorApp(tk.Tk):
                 state="normal",
             )
 
+    @staticmethod
+    def _new_item_record(
+        *,
+        sku: str = "",
+        quantity: int = 1,
+        unit_price="",
+        amount="",
+    ) -> dict:
+        """Create one item record with all workflow defaults in one place."""
+        return {
+            "sku": str(sku).strip().upper(),
+            "quantity": int(quantity),
+            "unit_price": unit_price,
+            "amount": amount,
+            "classification": "",
+            "odoo_tag": "",
+            "decision": DEFAULT_DECISION,
+            "status": RETURNED_STATUS,
+            "platform": PLATFORM,
+            "grade": "",
+            "remarks": "",
+        }
+
     def process_order_page(self, page):
         self.reset_case()
 
@@ -847,22 +879,14 @@ class ReturnProcessorApp(tk.Tk):
                 "",
             )
 
-            items.append({
-                "sku": str(product["sku"]).strip().upper(),
-                "quantity": int(product["quantity"]),
-                "unit_price": product.get(
-                    "unit_price",
-                    "",
-                ),
-                "amount": amount,
-                "classification": "",
-                "odoo_tag": "",
-                "decision": "Disputed",
-                "status": "Returned",
-                "platform": "Shopee",
-                "grade": "",
-                "remarks": "",
-            })
+            items.append(
+                self._new_item_record(
+                    sku=product["sku"],
+                    quantity=product["quantity"],
+                    unit_price=product.get("unit_price", ""),
+                    amount=amount,
+                )
+            )
 
         self.returned_products = items
         self.populate_products_table()
@@ -938,10 +962,9 @@ class ReturnProcessorApp(tk.Tk):
         )
 
     def clear_products_table(self):
-        for iid in self.products_table.get_children():
-            self.products_table.delete(
-                iid
-            )
+        children = self.products_table.get_children()
+        if children:
+            self.products_table.delete(*children)
 
     def populate_products_table(self):
         self.clear_products_table()
@@ -1067,6 +1090,7 @@ class ReturnProcessorApp(tk.Tk):
         )
 
         self.update_grade_state()
+        self.update_odoo_tag_state()
 
     def _ensure_item_list_mutable(self):
         """
@@ -1121,19 +1145,7 @@ class ReturnProcessorApp(tk.Tk):
             )
             return
 
-        new_item = {
-            "sku": "",
-            "quantity": 1,
-            "unit_price": "",
-            "amount": "",
-            "classification": "",
-            "odoo_tag": "",
-            "decision": "Disputed",
-            "status": "Returned",
-            "platform": "Shopee",
-            "grade": "",
-            "remarks": "",
-        }
+        new_item = self._new_item_record()
 
         self.returned_products.append(
             new_item
@@ -1489,7 +1501,10 @@ class ReturnProcessorApp(tk.Tk):
             ),
         )
 
-        if not enabled:
+        if enabled:
+            self.update_odoo_tag_state()
+            self.update_grade_state()
+        else:
             self.grade_combo.config(
                 state="disabled",
             )
@@ -1505,8 +1520,8 @@ class ReturnProcessorApp(tk.Tk):
 
         self.classification_combo.set("")
         self.odoo_tag_combo.set("")
-        self.decision_combo.set("Disputed")
-        self.return_status_combo.set("Returned")
+        self.decision_combo.set(DEFAULT_DECISION)
+        self.return_status_combo.set(RETURNED_STATUS)
         self.grade_combo.set("")
 
         self.remarks_text.config(
@@ -1519,6 +1534,23 @@ class ReturnProcessorApp(tk.Tk):
 
     def on_classification_changed(self, _event=None):
         self.update_grade_state()
+
+    def on_status_changed(self, _event=None):
+        self.update_odoo_tag_state()
+
+    def update_odoo_tag_state(self):
+        controls_enabled = (
+            str(self.classification_combo.cget("state")) != "disabled"
+        )
+
+        self.odoo_tag_combo.config(
+            state=(
+                "readonly"
+                if controls_enabled
+                and self.return_status_combo.get().strip() == RETURNED_STATUS
+                else "disabled"
+            )
+        )
 
     def update_grade_state(self):
         enabled = (
@@ -1580,9 +1612,9 @@ class ReturnProcessorApp(tk.Tk):
             raise ValueError(
                 f"Select Classification for {item['sku']}."
             )
-        if not odoo_tag:
+        if status == RETURNED_STATUS and not odoo_tag:
             raise ValueError(
-                f"Select Odoo Tag for {item['sku']}."
+                f"Select Odoo Tag for returned item {item['sku']}."
             )
         if not decision:
             raise ValueError(
@@ -1603,7 +1635,7 @@ class ReturnProcessorApp(tk.Tk):
             "odoo_tag": odoo_tag,
             "decision": decision,
             "status": status,
-            "platform": "Shopee",
+            "platform": PLATFORM,
             "grade": grade,
             "remarks": remarks,
         }
@@ -1741,7 +1773,6 @@ class ReturnProcessorApp(tk.Tk):
 
             for field, label in (
                 ("classification", "Classification"),
-                ("odoo_tag", "Odoo Tag"),
                 ("decision", "Decision"),
                 ("status", "Status"),
             ):
@@ -1750,6 +1781,16 @@ class ReturnProcessorApp(tk.Tk):
                         f"{label} is missing for {sku}."
                     )
 
+            # Odoo Tag is only needed when the physical item was returned
+            # and will actually be filed into Odoo.
+            if (
+                str(item.get("status", "")).strip() == RETURNED_STATUS
+                and not str(item.get("odoo_tag", "")).strip()
+            ):
+                raise ValueError(
+                    f"Odoo Tag is missing for returned item {sku}."
+                )
+
             if (
                 item["classification"] == "Unsealed"
                 and not str(item.get("grade", "")).strip()
@@ -1757,6 +1798,60 @@ class ReturnProcessorApp(tk.Tk):
                 raise ValueError(
                     f"Grade is required for unsealed item {sku}."
                 )
+
+    def returned_items_for_odoo(self):
+        """Items that physically came back and therefore require Odoo."""
+        return [
+            item
+            for item in self.returned_products
+            if str(item.get("status", "")).strip() == RETURNED_STATUS
+        ]
+
+    def not_returned_items(self):
+        """Items that require Lark filing but no Odoo stock return."""
+        return [
+            item
+            for item in self.returned_products
+            if str(item.get("status", "")).strip() != RETURNED_STATUS
+        ]
+
+    def _sync_action_buttons(self, busy=False):
+        """Single source of truth for workflow button availability."""
+        if busy:
+            states = {
+                self.open_order_button: "disabled",
+                self.confirm_decision_button: "disabled",
+                self.create_odoo_button: "disabled",
+                self.file_lark_button: "disabled",
+            }
+        else:
+            returned_items = (
+                self.returned_items_for_odoo()
+                if self.case_decision
+                else []
+            )
+            states = {
+                self.open_order_button: "normal",
+                self.confirm_decision_button: (
+                    "normal" if self.returned_products else "disabled"
+                ),
+                self.create_odoo_button: (
+                    "normal"
+                    if self.case_decision
+                    and returned_items
+                    and not self.odoo_results
+                    else "disabled"
+                ),
+                self.file_lark_button: (
+                    "normal"
+                    if self.case_decision
+                    and (not returned_items or self.odoo_results)
+                    else "disabled"
+                ),
+            }
+
+        for button, state in states.items():
+            button.config(state=state)
 
     def confirm_decision(self):
         try:
@@ -1783,12 +1878,18 @@ class ReturnProcessorApp(tk.Tk):
                 "confirmed": True,
             }
 
-            self.create_odoo_button.config(
-                state="normal",
-            )
-            self.file_lark_button.config(
-                state="disabled",
-            )
+            returned_items = self.returned_items_for_odoo()
+
+            if not returned_items:
+                self.odoo_results = None
+                self.odoo_result_label.config(
+                    text=(
+                        "Odoo skipped: all confirmed items are Not Returned.\n"
+                        "Ready for direct Lark filing."
+                    ),
+                )
+
+            self._sync_action_buttons()
 
             print(
                 "\nCONFIRMED RETURN ITEMS:"
@@ -1801,9 +1902,14 @@ class ReturnProcessorApp(tk.Tk):
                     f"{item['decision']} | {item['odoo_tag']}"
                 )
 
-            self.set_status(
-                "All item decisions confirmed. Ready for Odoo."
-            )
+            if returned_items:
+                self.set_status(
+                    "All item decisions confirmed. Ready for Odoo."
+                )
+            else:
+                self.set_status(
+                    "All items are Not Returned. Odoo skipped; ready for Lark."
+                )
 
         except ValueError as error:
             messagebox.showwarning(
@@ -1829,7 +1935,7 @@ class ReturnProcessorApp(tk.Tk):
         self.odoo_result_label.config(
             text=(
                 "Item data changed. Confirm All Items again "
-                "before Odoo processing."
+                "before processing."
             ),
         )
 
@@ -1860,10 +1966,24 @@ class ReturnProcessorApp(tk.Tk):
                 "Creating Odoo ticket..."
             )
 
+            returned_items = self.returned_items_for_odoo()
+
+            if not returned_items:
+                self.set_status(
+                    "Odoo skipped: no items have Status = Returned."
+                )
+                self.create_odoo_button.config(
+                    state="disabled",
+                )
+                self.file_lark_button.config(
+                    state="normal",
+                )
+                return
+
             self.odoo_results = create_odoo_tickets(
                 context=self.browser.context,
                 order_id=self.current_order_id,
-                returned_products=self.returned_products,
+                returned_products=returned_items,
                 case_decision=self.case_decision,
                 progress_callback=self.set_status,
             )
@@ -1941,10 +2061,22 @@ class ReturnProcessorApp(tk.Tk):
     # =========================================================
 
     def file_lark_form(self):
-        if not self.odoo_results:
+        if not self.case_decision:
+            messagebox.showwarning(
+                "Confirmation Required",
+                "Confirm all returned items before filing Lark.",
+            )
+            return
+
+        returned_items = self.returned_items_for_odoo()
+
+        if returned_items and not self.odoo_results:
             messagebox.showwarning(
                 "Odoo Required",
-                "Complete Odoo processing before filing Lark.",
+                (
+                    "This order contains item(s) with Status = Returned. "
+                    "Complete Odoo processing for those items before filing Lark."
+                ),
             )
             return
 
@@ -1971,14 +2103,20 @@ class ReturnProcessorApp(tk.Tk):
                 "",
                 (
                     f"Lark filed {len(self.lark_results)} "
-                    "Odoo transfer(s):"
+                    "record(s):"
                 ),
             ]
 
             for result in self.lark_results:
+                transfer_display = (
+                    result["transfer_id"]
+                    if result.get("transfer_id")
+                    else "No Transfer (Not Returned)"
+                )
+
                 lines.append(
                     (
-                        f"{result['transfer_id']} | "
+                        f"{transfer_display} | "
                         f"Decision: {result['decision']} | "
                         f"{result['sku']} | "
                         f"Total QTY {result['quantity']} | "
@@ -1993,7 +2131,7 @@ class ReturnProcessorApp(tk.Tk):
             self.set_status(
                 (
                     f"Lark filing completed: "
-                    f"{len(self.lark_results)} Transfer ID(s) filed."
+                    f"{len(self.lark_results)} Lark record(s) filed."
                 )
             )
 
@@ -2022,39 +2160,8 @@ class ReturnProcessorApp(tk.Tk):
         self.update_idletasks()
 
     def set_processing_buttons(self, busy):
-        if busy:
-            self.open_order_button.config(
-                state="disabled",
-            )
-            self.confirm_decision_button.config(
-                state="disabled",
-            )
-            self.create_odoo_button.config(
-                state="disabled",
-            )
-            self.file_lark_button.config(
-                state="disabled",
-            )
-            return
+        self._sync_action_buttons(busy=busy)
 
-        self.open_order_button.config(
-            state="normal",
-        )
-
-        if self.returned_products:
-            self.confirm_decision_button.config(
-                state="normal",
-            )
-
-        if self.case_decision:
-            self.create_odoo_button.config(
-                state="normal",
-            )
-
-        if self.odoo_results:
-            self.file_lark_button.config(
-                state="normal",
-            )
 
     def on_close(self):
         try:

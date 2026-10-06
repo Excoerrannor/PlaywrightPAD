@@ -6,53 +6,74 @@ DEFAULT_TIMEOUT = 30_000
 SLOW_ODOO_TIMEOUT = 60_000
 ODOO_COMMIT_BUFFER_MS = 700
 
+_TICKET_URL_RE = re.compile(
+    r".*/odoo/helpdesk/3/tickets/\d+(?:[/?#].*)?$"
+)
+_TRANSFER_ID_RE = re.compile(r"TC/IN/\d+")
+_SKU_RE = re.compile(r"\[(MLE\d+)\]")
+
+_RETURN_TABLE_JS = """
+rows => rows.map(row => {
+    const productCell = row.querySelector('td[name="product_id"]');
+    const qtyCell = row.querySelector('td[name="quantity"]');
+    const qtyInput = qtyCell?.querySelector('input');
+
+    return {
+        product:
+            productCell?.getAttribute('data-tooltip') ||
+            productCell?.textContent?.trim() ||
+            "",
+        quantity:
+            qtyInput
+                ? qtyInput.value
+                : qtyCell?.textContent?.trim() || ""
+    };
+})
+"""
+
+
+def _text(value) -> str:
+    return str(value or "").strip()
+
+
+def _unique(values):
+    return list(dict.fromkeys(
+        value for value in (_text(v) for v in values) if value
+    ))
+
+
+def _progress(callback, message: str):
+    if callback:
+        callback(message)
+    print(message)
+
 
 def build_ticket_title(order_id: str, returned_products: list[dict]) -> str:
     """
-    Build: ORDER ID - SKU_QTY, SKU_QTY...
-
-    Duplicate SKU rows are combined in the ticket title only.
-
-    Example:
-        MLE03495_1 Unsealed
-        MLE03495_1 Defective
-
-    becomes:
-        ORDER ID - MLE03495_2
-
-    The item rows themselves remain separate so Odoo can still create
-    different Return / QC flows for each classification.
+    Build ORDER ID - SKU_QTY while combining duplicate SKU rows in the title
+    only. The underlying item rows stay separate for different return routes.
     """
     if not returned_products:
         raise ValueError("At least one returned product is required.")
 
-    qty_by_sku = {}
-    sku_order = []
-
+    quantities = {}
+    order = []
     for item in returned_products:
-        sku = str(item["sku"]).strip()
-        quantity = int(item["quantity"])
+        sku = _text(item["sku"])
+        if sku not in quantities:
+            quantities[sku] = 0
+            order.append(sku)
+        quantities[sku] += int(item["quantity"])
 
-        if sku not in qty_by_sku:
-            qty_by_sku[sku] = 0
-            sku_order.append(sku)
-
-        qty_by_sku[sku] += quantity
-
-    parts = [
-        f"{sku}_{qty_by_sku[sku]}"
-        for sku in sku_order
-    ]
-
-    return f"{order_id} - " + ", ".join(parts)
+    return (
+        f"{_text(order_id)} - "
+        + ", ".join(f"{sku}_{quantities[sku]}" for sku in order)
+    )
 
 
 def get_or_open_odoo_page(context):
     for page in context.pages:
-        if page.is_closed():
-            continue
-
-        if "/odoo/helpdesk/3/tickets" in page.url:
+        if not page.is_closed() and "/odoo/helpdesk/3/tickets" in page.url:
             return page
 
     page = context.new_page()
@@ -67,36 +88,22 @@ def get_or_open_odoo_page(context):
 def _set_basic_ticket_fields(page, ticket_title: str):
     page.get_by_role("button", name="New").click()
 
-    title_box = page.get_by_role(
-        "textbox",
-        name="Ticket Title",
-    )
-    title_box.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-    title_box.fill(ticket_title)
+    title = page.get_by_role("textbox", name="Ticket Title")
+    title.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    title.fill(ticket_title)
 
-    assigned_to = page.get_by_role(
-        "combobox",
-        name="Assigned to",
-    )
+    assigned_to = page.get_by_role("combobox", name="Assigned to")
     assigned_to.click()
     assigned_to.fill("Tech")
-
     page.get_by_role(
         "option",
         name="Technical Department",
         exact=True,
     ).click()
 
-    customer = page.get_by_role(
-        "combobox",
-        name="Customer",
-    )
+    customer = page.get_by_role("combobox", name="Customer")
     customer.click()
     customer.fill("Shop")
-
     page.get_by_role(
         "option",
         name="ECOMMERCE, SHOPEE",
@@ -105,247 +112,116 @@ def _set_basic_ticket_fields(page, ticket_title: str):
 
 
 def _create_and_open_ticket(page, ticket_title: str) -> str:
-    page.get_by_role(
-        "button",
-        name="Add",
-        exact=True,
-    ).click()
+    page.get_by_role("button", name="Add", exact=True).click()
 
-    created_ticket = page.get_by_text(
-        ticket_title,
-        exact=True,
-    ).first
+    created = page.get_by_text(ticket_title, exact=True).first
+    created.wait_for(state="visible", timeout=SLOW_ODOO_TIMEOUT)
+    created.click()
 
-    created_ticket.wait_for(
+    page.wait_for_url(_TICKET_URL_RE, timeout=SLOW_ODOO_TIMEOUT)
+    page.get_by_role("combobox", name="Product?").wait_for(
         state="visible",
         timeout=SLOW_ODOO_TIMEOUT,
     )
-
-    created_ticket.click()
-
-    page.wait_for_url(
-        re.compile(
-            r".*/odoo/helpdesk/3/tickets/\d+(?:[/?#].*)?$"
-        ),
-        timeout=SLOW_ODOO_TIMEOUT,
-    )
-
-    product_field = page.get_by_role(
-        "combobox",
-        name="Product?",
-    )
-    product_field.wait_for(
-        state="visible",
-        timeout=SLOW_ODOO_TIMEOUT,
-    )
-
     return page.url
 
 
 def _select_product(page, sku: str):
-    product_field = page.get_by_role(
-        "combobox",
-        name="Product?",
-    )
+    field = page.get_by_role("combobox", name="Product?")
+    field.click()
+    field.fill(sku)
 
-    product_field.click()
-    product_field.fill(sku)
-
-    sku_option = page.get_by_role(
+    option = page.get_by_role(
         "option",
-        name=re.compile(
-            rf"^\[{re.escape(sku)}\]"
-        ),
+        name=re.compile(rf"^\[{re.escape(sku)}\]"),
     ).first
-
-    sku_option.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    sku_option.click()
+    option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    option.click()
 
 
 def _select_tags(page, tags: list[str]):
-    """
-    Add all unique Odoo tags to the same Helpdesk ticket.
-    Odoo's Tags field is many-to-many, so several tags can coexist.
-    """
-    unique_tags = []
-    for tag in tags:
-        tag = str(tag).strip()
-        if tag and tag not in unique_tags:
-            unique_tags.append(tag)
-
-    if not unique_tags:
+    tags = _unique(tags)
+    if not tags:
         raise ValueError("At least one Odoo tag is required.")
 
-    for tag in unique_tags:
-        tag_field = page.get_by_role(
-            "combobox",
-            name="Tags",
-        )
-        tag_field.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
-        tag_field.click()
-        tag_field.fill(tag[:12])
+    for tag in tags:
+        field = page.get_by_role("combobox", name="Tags")
+        field.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        field.click()
+        field.fill(tag[:12])
 
-        tag_option = page.get_by_role(
-            "option",
-            name=tag,
-            exact=True,
-        )
-        tag_option.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
-        tag_option.click()
-
+        option = page.get_by_role("option", name=tag, exact=True)
+        option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        option.click()
 
 
 def _set_urgent_priority(page):
-    urgent = page.get_by_role(
-        "radio",
-        name="Urgent",
-    )
-
-    urgent.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
+    urgent = page.get_by_role("radio", name="Urgent")
+    urgent.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
     urgent.click()
 
 
 def _get_return_dialog(page):
-    """
-    Return the active Odoo Return modal.
-    """
-
-    dialog = page.get_by_role(
-        "dialog",
-    ).last
-
-    dialog.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
+    dialog = page.get_by_role("dialog").last
+    dialog.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
     return dialog
 
 
-def _get_return_rows(dialog):
-    """
-    Return only actual product rows from product_return_moves.
-    """
+def _moves_table(dialog):
+    table = dialog.locator('div[name="product_return_moves"]')
+    table.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    return table
 
-    moves_table = dialog.locator(
-        'div[name="product_return_moves"]'
-    )
 
-    moves_table.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    rows = moves_table.locator(
-        "tbody > tr.o_data_row"
-    )
-
-    rows.first.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
+def _return_rows(dialog):
+    rows = _moves_table(dialog).locator("tbody > tr.o_data_row")
+    rows.first.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
     return rows
 
 
-def _debug_return_rows(rows):
+def _read_return_table(dialog) -> dict[str, float]:
     """
-    Print products currently detected in the Odoo return table.
+    One browser round-trip for the entire return table.
+    Result: {SKU: quantity}
     """
-
-    data = rows.evaluate_all(
-        """
-        rows => rows.map(row => ({
-            product:
-                row.querySelector('td[name="product_id"]')
-                    ?.textContent?.trim() || "",
-            quantity:
-                row.querySelector('td[name="quantity"]')
-                    ?.textContent?.trim() || ""
-        }))
-        """
-    )
-
-    print("\nODOO RETURN PRODUCT ROWS:")
+    data = _return_rows(dialog).evaluate_all(_RETURN_TABLE_JS)
+    result = {}
 
     for item in data:
-        print(
-            f"{item['product']} | "
-            f"QTY {item['quantity']}"
-        )
+        match = _SKU_RE.search(_text(item.get("product")))
+        if not match:
+            continue
 
-    return data
+        raw = _text(item.get("quantity")).replace(",", "") or "0"
+        try:
+            result[match.group(1)] = float(raw)
+        except ValueError:
+            result[match.group(1)] = 0.0
+
+    return result
 
 
 def _find_return_product_row(dialog, sku: str):
     """
-    Find the exact Odoo return row for the requested SKU.
-
-    Important:
-    when Odoo puts a row into edit mode, the visible product text can
-    disappear and be replaced by a combobox input. However, the stable
-    td[name="product_id"] data-tooltip still contains the original product
-    text, e.g.:
-
-        data-tooltip="[MLE08858] Bambu Lab Filament ..."
-
-    Therefore we identify and verify rows using data-tooltip, not inner_text.
+    Locate the exact SKU using Odoo's stable product data-tooltip.
     """
-
-    moves_table = dialog.locator(
-        'div[name="product_return_moves"]'
-    )
-
-    moves_table.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    target_row = moves_table.locator(
+    row = _moves_table(dialog).locator(
         (
             "tbody > tr.o_data_row:"
             f'has(td[name="product_id"][data-tooltip^="[{sku}]"])'
         )
     ).first
+    row.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
 
-    target_row.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
+    tooltip = _text(
+        row.locator('td[name="product_id"]').get_attribute("data-tooltip")
     )
-
-    product_cell = target_row.locator(
-        'td[name="product_id"]'
-    )
-
-    product_tooltip = (
-        product_cell.get_attribute("data-tooltip")
-        or ""
-    ).strip()
-
-    if not product_tooltip.startswith(
-        f"[{sku}]"
-    ):
+    if not tooltip.startswith(f"[{sku}]"):
         raise ValueError(
             f"Odoo row safety check failed. "
-            f"Expected SKU {sku}, found: {product_tooltip!r}"
+            f"Expected SKU {sku}, found: {tooltip!r}"
         )
-
-    return target_row
-
+    return row
 
 
 def _set_return_row_quantity(
@@ -355,118 +231,92 @@ def _set_return_row_quantity(
     quantity: int,
 ):
     """
-    Set the return quantity for the exact SKU row.
-
-    This avoids bounding_box()/mouse coordinates entirely.
-
-    Odoo behavior observed during testing:
-      - locator.click() DOES activate/highlight the correct cell
-      - but Odoo immediately rerenders the row
-      - Playwright can then report a click timeout even though the click worked
-
-    Strategy:
-      1. locate exact SKU row from stable product data-tooltip
-      2. click its quantity cell with a very short timeout
-      3. ignore a click timeout because the DOM may have rerendered
-      4. reacquire the exact SKU row
-      5. check for the quantity input inside that same row
-      6. if no input exists yet, repeat the click once
-      7. fill and verify the quantity
-
-    No Ctrl+A, Tab, Enter, click-away, or coordinate-based clicking is used.
+    Activate and fill the exact quantity cell without coordinates, Ctrl+A,
+    Tab, Enter, or click-away behavior.
     """
-
     for attempt in range(2):
-
-        # Always reacquire because Odoo may replace the row after each click.
-        target_row = _find_return_product_row(
-            dialog=dialog,
-            sku=sku,
-        )
-
-        qty_cell = target_row.locator(
-            'td[name="quantity"]'
-        )
-
-        qty_cell.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
+        row = _find_return_product_row(dialog, sku)
+        cell = row.locator('td[name="quantity"]')
+        cell.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
 
         try:
-            # Short timeout is intentional. The click can succeed visually
-            # and then Odoo replaces the clicked DOM node immediately.
-            qty_cell.click(
-                force=True,
-                timeout=1_500,
-            )
+            # Odoo may replace the clicked node immediately after the click.
+            cell.click(force=True, timeout=1_500)
         except Exception:
-            # Do not fail here. Reacquire the row and inspect whether
-            # Odoo actually entered inline edit mode.
             pass
 
-        page.wait_for_timeout(
-            200
-        )
+        page.wait_for_timeout(200)
 
-        # Reacquire the exact same SKU row after Odoo's rerender.
-        target_row = _find_return_product_row(
-            dialog=dialog,
-            sku=sku,
-        )
-
-        qty_input = target_row.locator(
-            'td[name="quantity"] input'
-        ).first
+        row = _find_return_product_row(dialog, sku)
+        qty_input = row.locator('td[name="quantity"] input').first
 
         try:
-            qty_input.wait_for(
-                state="visible",
-                timeout=1_500,
-            )
+            qty_input.wait_for(state="visible", timeout=1_500)
         except Exception:
             if attempt == 0:
-                # First click may only select/highlight the cell.
-                # Repeat once on the exact same SKU row.
                 continue
-
             raise RuntimeError(
                 f"Odoo found and selected SKU {sku}, "
                 "but its Quantity input did not enter edit mode."
             )
 
-        qty_input.fill(
-            str(quantity)
-        )
-
-        actual_value = qty_input.input_value().strip()
+        qty_input.fill(str(quantity))
+        actual = _text(qty_input.input_value())
 
         try:
-            actual_number = float(
-                actual_value
-            )
+            actual_number = float(actual)
         except ValueError as error:
             raise RuntimeError(
-                f"Invalid quantity value for {sku}: "
-                f"{actual_value!r}"
+                f"Invalid quantity value for {sku}: {actual!r}"
             ) from error
 
         if actual_number != float(quantity):
             raise RuntimeError(
                 f"Quantity verification failed for {sku}. "
-                f"Expected {quantity}, got {actual_value!r}."
+                f"Expected {quantity}, got {actual!r}."
             )
 
-        print(
-            f"ODOO RETURN QTY SET: {sku} = {quantity}"
-        )
-
+        print(f"ODOO RETURN QTY SET: {sku} = {quantity}")
         return
 
-    raise RuntimeError(
-        f"Could not enter return quantity for {sku}."
-    )
+    raise RuntimeError(f"Could not enter return quantity for {sku}.")
 
+
+def _wait_for_return_skus(dialog, expected_skus) -> dict[str, float]:
+    """
+    Event-driven wait for every expected SKU. This replaces repeated full-table
+    polling while preserving the protection against Odoo's progressive render.
+    """
+    expected = {_text(sku) for sku in expected_skus if _text(sku)}
+
+    try:
+        table = _moves_table(dialog)
+        for sku in expected:
+            table.locator(
+                f'td[name="product_id"][data-tooltip^="[{sku}]"]'
+            ).first.wait_for(
+                state="attached",
+                timeout=SLOW_ODOO_TIMEOUT,
+            )
+    except Exception as error:
+        current = _read_return_table(dialog)
+        missing = expected - set(current)
+        raise RuntimeError(
+            "These returned SKU(s) were not found in the Odoo Sales Order "
+            "after waiting for the full Return table to load: "
+            + ", ".join(sorted(missing or expected))
+        ) from error
+
+    current = _read_return_table(dialog)
+    missing = expected - set(current)
+    if missing:
+        raise RuntimeError(
+            "These returned SKU(s) were not found in the Odoo Sales Order: "
+            + ", ".join(sorted(missing))
+        )
+
+    print("ODOO RETURN ITEMS READY:", ", ".join(sorted(current)))
+    return current
 
 
 def _verify_return_quantities(
@@ -474,171 +324,26 @@ def _verify_return_quantities(
     expected_by_sku: dict[str, int],
 ):
     """
-    Final safety gate before Return.
-
-    Every SKU in expected_by_sku must equal the requested quantity.
-    Every other product in the Sales Order must remain at 0.
+    Final safety gate: target SKUs must equal requested quantities and every
+    non-target SKU must remain zero.
     """
-    rows = _get_return_rows(dialog)
-
-    data = rows.evaluate_all(
-        """
-        rows => rows.map(row => {
-            const productCell = row.querySelector('td[name="product_id"]');
-            const qtyCell = row.querySelector('td[name="quantity"]');
-            const qtyInput = qtyCell?.querySelector('input');
-
-            return {
-                product:
-                    productCell?.getAttribute('data-tooltip') ||
-                    productCell?.textContent?.trim() ||
-                    "",
-                quantity:
-                    qtyInput
-                        ? qtyInput.value
-                        : qtyCell?.textContent?.trim() || ""
-            };
-        })
-        """
-    )
-
-    found = set()
-
-    print("\nODOO RETURN PRE-SUBMIT CHECK:")
-
-    for item in data:
-        product_text = str(item["product"]).strip()
-        match = re.search(r"\[(MLE\d+)\]", product_text)
-        if not match:
-            continue
-
-        sku = match.group(1)
-        raw_qty = str(item["quantity"]).strip().replace(",", "") or "0"
-
-        try:
-            qty = float(raw_qty)
-        except ValueError as error:
-            raise RuntimeError(
-                f"Could not read return quantity for {sku}: {raw_qty!r}"
-            ) from error
-
-        expected = float(expected_by_sku.get(sku, 0))
-        print(f"{sku} | actual {qty} | expected {expected}")
-
-        if sku in expected_by_sku:
-            found.add(sku)
-
-        if qty != expected:
-            raise RuntimeError(
-                f"Safety stop: {sku} should return {expected:g}, "
-                f"but Odoo currently shows {qty:g}. Return was NOT submitted."
-            )
-
-    missing = set(expected_by_sku) - found
+    current = _read_return_table(dialog)
+    missing = set(expected_by_sku) - set(current)
     if missing:
         raise RuntimeError(
             "Safety stop: target SKU(s) not found in Odoo Return table: "
             + ", ".join(sorted(missing))
         )
 
-
-
-def _read_return_table(dialog) -> dict[str, float]:
-    """Read current Odoo return quantities keyed by SKU."""
-    rows = _get_return_rows(dialog)
-
-    data = rows.evaluate_all(
-        """
-        rows => rows.map(row => {
-            const productCell = row.querySelector('td[name="product_id"]');
-            const qtyCell = row.querySelector('td[name="quantity"]');
-            const qtyInput = qtyCell?.querySelector('input');
-
-            return {
-                product:
-                    productCell?.getAttribute('data-tooltip') ||
-                    productCell?.textContent?.trim() ||
-                    "",
-                quantity:
-                    qtyInput
-                        ? qtyInput.value
-                        : qtyCell?.textContent?.trim() || ""
-            };
-        })
-        """
-    )
-
-    result = {}
-    for item in data:
-        match = re.search(r"\[(MLE\d+)\]", str(item["product"]))
-        if not match:
-            continue
-
-        raw = str(item["quantity"]).strip().replace(",", "") or "0"
-        try:
-            result[match.group(1)] = float(raw)
-        except ValueError:
-            result[match.group(1)] = 0.0
-
-    return result
-
-
-def _wait_for_return_skus(
-    page,
-    dialog,
-    expected_skus,
-):
-    """
-    Wait until Odoo has finished rendering ALL expected returned products.
-
-    Odoo can render the first product row before the remaining rows appear.
-    The previous code continued as soon as the first row was visible, which
-    could make a valid second SKU look "missing".
-
-    Returns the fully observed SKU -> quantity mapping.
-    """
-
-    expected_skus = {
-        str(sku).strip()
-        for sku in expected_skus
-    }
-
-    deadline_ms = SLOW_ODOO_TIMEOUT
-    elapsed_ms = 0
-    poll_ms = 250
-    last_seen = {}
-
-    while elapsed_ms < deadline_ms:
-        last_seen = _read_return_table(
-            dialog
-        )
-
-        seen_skus = set(
-            last_seen
-        )
-
-        missing = (
-            expected_skus
-            - seen_skus
-        )
-
-        if not missing:
-            print(
-                "ODOO RETURN ITEMS READY:",
-                ", ".join(sorted(seen_skus)),
+    print("\nODOO RETURN PRE-SUBMIT CHECK:")
+    for sku, actual in current.items():
+        expected = float(expected_by_sku.get(sku, 0))
+        print(f"{sku} | actual {actual} | expected {expected}")
+        if actual != expected:
+            raise RuntimeError(
+                f"Safety stop: {sku} should return {expected:g}, "
+                f"but Odoo currently shows {actual:g}. Return was NOT submitted."
             )
-            return last_seen
-
-        page.wait_for_timeout(
-            poll_ms
-        )
-        elapsed_ms += poll_ms
-
-    raise RuntimeError(
-        "These returned SKU(s) were not found in the Odoo Sales Order "
-        "after waiting for the full Return table to load: "
-        + ", ".join(sorted(expected_skus - set(last_seen)))
-    )
 
 
 def _open_return_transfer(
@@ -646,176 +351,54 @@ def _open_return_transfer(
     order_id: str,
     items: list[dict],
 ):
-    """
-    Create ONE Odoo Return for all items in this return group.
-
-    Example:
-        MLE02804 | QTY 1 | New | Disputed
-        MLE05243 | QTY 1 | New | Disputed
-
-    becomes one Return with:
-        MLE02804 = 1
-        MLE05243 = 1
-        all unrelated products = 0
-
-    Important:
-    Odoo can render multi-item return rows progressively, so the automation
-    waits until every expected SKU is actually present before editing QTY.
-    """
-
     if not items:
-        raise ValueError(
-            "Return group contains no items."
-        )
+        raise ValueError("Return group contains no items.")
 
     desired = {}
-
     for item in items:
-        sku = str(
-            item["sku"]
-        ).strip()
+        sku = _text(item["sku"])
+        desired[sku] = desired.get(sku, 0) + int(item["quantity"])
 
-        desired[sku] = (
-            desired.get(sku, 0)
-            + int(item["quantity"])
-        )
+    button = page.get_by_role("button", name="Return", exact=True)
+    button.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    button.click()
 
-    # --------------------------------------------------------
-    # Open Return wizard
-    # --------------------------------------------------------
+    dialog = _get_return_dialog(page)
 
-    return_button = page.get_by_role(
-        "button",
-        name="Return",
-        exact=True,
-    )
-
-    return_button.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    return_button.click()
-
-    dialog = _get_return_dialog(
-        page
-    )
-
-    # --------------------------------------------------------
-    # Select Sales Order
-    # --------------------------------------------------------
-
-    sales_order = dialog.get_by_role(
-        "combobox",
-        name="Sales Order",
-    )
-
-    sales_order.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    sales_order.fill(
-        order_id[-4:]
-    )
+    sales_order = dialog.get_by_role("combobox", name="Sales Order")
+    sales_order.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    sales_order.fill(order_id[-4:])
 
     order_option = page.get_by_role(
         "option",
         name=order_id,
         exact=True,
     )
-
-    order_option.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
+    order_option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
     order_option.click()
 
-    # --------------------------------------------------------
-    # WAIT FOR ALL RETURNED SKUs
-    # --------------------------------------------------------
-    # Previously we only waited for the first o_data_row. On multi-item
-    # orders Odoo may display row 1 before row 2 has been rendered.
-
-    current = _wait_for_return_skus(
-        page=page,
-        dialog=dialog,
-        expected_skus=set(desired),
-    )
-
-    print(
-        "\nODOO RETURN TABLE BEFORE EDIT:"
-    )
-
+    current = _wait_for_return_skus(dialog, desired)
+    print("\nODOO RETURN TABLE BEFORE EDIT:")
     for sku, qty in current.items():
-        print(
-            f"{sku} | QTY {qty}"
-        )
+        print(f"{sku} | QTY {qty}")
 
-    # --------------------------------------------------------
-    # Set every item belonging to this Return
-    # --------------------------------------------------------
+    for sku, quantity in desired.items():
+        print(f"SETTING ODOO RETURN: {sku} -> {quantity}")
+        _set_return_row_quantity(page, dialog, sku, quantity)
 
-    for sku, wanted in desired.items():
-        print(
-            f"SETTING ODOO RETURN: {sku} -> {wanted}"
-        )
+    _verify_return_quantities(dialog, desired)
 
-        _set_return_row_quantity(
-            page=page,
-            dialog=dialog,
-            sku=sku,
-            quantity=wanted,
-        )
-
-    # --------------------------------------------------------
-    # Safety verification
-    # --------------------------------------------------------
-    # Every target must have the requested QTY and every unrelated item
-    # must remain zero before Return is allowed to continue.
-
-    _verify_return_quantities(
-        dialog=dialog,
-        expected_by_sku=desired,
-    )
-
-    # --------------------------------------------------------
-    # Submit ONE Return containing all grouped SKUs
-    # --------------------------------------------------------
-
-    create_returns = dialog.locator(
-        'button[name="action_create_returns"]'
-    )
-
-    create_returns.wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-
-    create_returns.click()
-
+    create = dialog.locator('button[name="action_create_returns"]')
+    create.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    create.click()
 
 
 def _capture_transfer(page):
-    transfer_heading = page.get_by_role(
-        "heading",
-    ).get_by_text(
-        re.compile(r"TC/IN/\d+")
-    ).first
+    heading = page.get_by_role("heading").get_by_text(_TRANSFER_ID_RE).first
+    heading.wait_for(state="visible", timeout=SLOW_ODOO_TIMEOUT)
 
-    transfer_heading.wait_for(
-        state="visible",
-        timeout=SLOW_ODOO_TIMEOUT,
-    )
-
-    heading_text = transfer_heading.inner_text().strip()
-
-    match = re.search(
-        r"TC/IN/\d+",
-        heading_text,
-    )
-
+    heading_text = _text(heading.inner_text())
+    match = _TRANSFER_ID_RE.search(heading_text)
     if not match:
         raise ValueError(
             f"Could not extract TC transfer ID from {heading_text!r}"
@@ -824,43 +407,25 @@ def _capture_transfer(page):
     return {
         "transfer_id": match.group(0),
         "transfer_url": page.url,
-        "heading": transfer_heading,
+        "heading": heading,
     }
 
 
 def _click_validate(page):
-    validate_button = page.get_by_role(
+    button = page.get_by_role(
         "button",
         name=re.compile(r"^Validate"),
     ).first
-
-    validate_button.wait_for(
-        state="visible",
-        timeout=SLOW_ODOO_TIMEOUT,
-    )
-
-    validate_button.click()
+    button.wait_for(state="visible", timeout=SLOW_ODOO_TIMEOUT)
+    button.click()
 
 
 def _process_brand_new(page):
-    """
-    Classification = New
-
-    Destination Location -> MNL/Stock
-    -> click TC/IN/##### heading to commit
-    -> Validate
-    """
-
     destination = page.get_by_role(
         "combobox",
         name="Destination Location",
     )
-
-    destination.wait_for(
-        state="visible",
-        timeout=SLOW_ODOO_TIMEOUT,
-    )
-
+    destination.wait_for(state="visible", timeout=SLOW_ODOO_TIMEOUT)
     destination.click()
     destination.fill("MNL/Stock")
 
@@ -872,14 +437,9 @@ def _process_brand_new(page):
 
     transfer = _capture_transfer(page)
 
-    # Required by the observed Odoo behavior so MNL/Stock is committed
-    # before Validate.
+    # Required by observed Odoo behavior so MNL/Stock commits before Validate.
     transfer["heading"].click()
-
-    page.wait_for_timeout(
-        ODOO_COMMIT_BUFFER_MS
-    )
-
+    page.wait_for_timeout(ODOO_COMMIT_BUFFER_MS)
     _click_validate(page)
 
     return {
@@ -897,71 +457,39 @@ def _wait_for_next_qc_dialog(
     processed_skus: set[str],
 ):
     """
-    Wait for the next automatically-opened TECHNICAL RETURN QC dialog.
-
-    Odoo opens one QC dialog per SKU in the validated transfer. The dialog
-    title contains the SKU, for example:
-
-        TECHNICAL RETURN QC : [MLE05696] ...
-
-    We use that SKU to decide whether this specific item should be routed to
-    TC/Stock/Open Box or TC/Defective.
+    Wait for the next automatically opened TECHNICAL RETURN QC dialog and
+    identify its SKU from the title.
     """
-
-    elapsed_ms = 0
+    elapsed = 0
     poll_ms = 250
 
-    while elapsed_ms < SLOW_ODOO_TIMEOUT:
-
-        dialogs = page.locator(
-            'div[role="dialog"]'
-        )
-
-        dialog_count = dialogs.count()
-
-        for index in range(dialog_count - 1, -1, -1):
+    while elapsed < SLOW_ODOO_TIMEOUT:
+        dialogs = page.locator('div[role="dialog"]')
+        for index in range(dialogs.count() - 1, -1, -1):
             dialog = dialogs.nth(index)
-
             if not dialog.is_visible():
                 continue
 
-            title = dialog.locator(
-                "h4.modal-title"
-            )
-
-            if title.count() == 0:
+            title = dialog.locator("h4.modal-title")
+            if not title.count():
                 continue
 
-            title_text = title.inner_text().strip()
-
+            title_text = _text(title.inner_text())
             if "TECHNICAL RETURN QC" not in title_text:
                 continue
 
-            match = re.search(
-                r"\[(MLE\d+)\]",
-                title_text,
-            )
-
+            match = _SKU_RE.search(title_text)
             if not match:
                 continue
 
             sku = match.group(1)
-
-            if (
-                sku in expected_skus
-                and sku not in processed_skus
-            ):
+            if sku in expected_skus and sku not in processed_skus:
                 return dialog, sku, title_text
 
-        page.wait_for_timeout(
-            poll_ms
-        )
-        elapsed_ms += poll_ms
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
 
-    remaining = sorted(
-        expected_skus - processed_skus
-    )
-
+    remaining = sorted(expected_skus - processed_skus)
     raise RuntimeError(
         "Timed out waiting for the next Odoo QC dialog. "
         "Remaining SKU(s): "
@@ -973,145 +501,75 @@ def _process_open_box_or_defective(
     page,
     items: list[dict],
 ):
-    """
-    Validate one Open Box / Defective Odoo transfer containing one or more SKUs.
-
-    Odoo opens ONE TECHNICAL RETURN QC dialog PER SKU after Validate.
-
-    For every QC dialog:
-        identify the SKU from the dialog title
-        -> Fail
-        -> Unsealed  => TC/Stock/Open Box
-        -> Defective => TC/Defective
-        -> Confirm
-        -> wait for Odoo to automatically open the next SKU's QC dialog
-
-    This continues until every SKU in the transfer has been processed.
-    """
-
     if not items:
         raise ValueError(
             "Open Box / Defective QC requires at least one item."
         )
 
+    route_by_classification = {
+        "Unsealed": "TC/Stock/Open Box",
+        "Defective": "TC/Defective",
+    }
     item_by_sku = {}
 
     for item in items:
-        sku = str(
-            item["sku"]
-        ).strip()
-
-        classification = str(
-            item.get("classification", "")
-        ).strip()
-
-        if classification == "Unsealed":
-            qc_result = "TC/Stock/Open Box"
-        elif classification == "Defective":
-            qc_result = "TC/Defective"
-        else:
+        sku = _text(item["sku"])
+        classification = _text(item.get("classification"))
+        try:
+            qc_result = route_by_classification[classification]
+        except KeyError as error:
             raise ValueError(
-                f"Unsupported QC classification for {sku}: "
-                f"{classification}"
-            )
+                f"Unsupported QC classification for {sku}: {classification}"
+            ) from error
 
         item_by_sku[sku] = {
             "classification": classification,
             "qc_result": qc_result,
         }
 
-    expected_skus = set(
-        item_by_sku
-    )
-
-    transfer = _capture_transfer(
-        page
-    )
-
-    _click_validate(
-        page
-    )
-
-    processed_skus = set()
+    expected = set(item_by_sku)
+    processed = set()
     qc_results = []
+    transfer = _capture_transfer(page)
 
-    while processed_skus != expected_skus:
+    _click_validate(page)
 
+    while processed != expected:
         dialog, sku, title_text = _wait_for_next_qc_dialog(
-            page=page,
-            expected_skus=expected_skus,
-            processed_skus=processed_skus,
+            page,
+            expected,
+            processed,
         )
+        route = item_by_sku[sku]["qc_result"]
 
-        qc_result = item_by_sku[
-            sku
-        ]["qc_result"]
+        print(f"ODOO QC: {sku} -> FAIL -> {route}")
+        print(f"QC DIALOG: {title_text}")
 
-        print(
-            f"ODOO QC: {sku} -> FAIL -> {qc_result}"
-        )
-        print(
-            f"QC DIALOG: {title_text}"
-        )
+        fail = dialog.get_by_role("button", name="Fail", exact=True)
+        fail.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        fail.click()
 
-        fail_button = dialog.get_by_role(
-            "button",
-            name="Fail",
-            exact=True,
-        )
+        option = page.get_by_text(route, exact=True).last
+        option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        option.click()
 
-        fail_button.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
-
-        fail_button.click()
-
-        # The Fail action opens the location/result selector.
-        qc_option = page.get_by_text(
-            qc_result,
-            exact=True,
-        ).last
-
-        qc_option.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
-
-        qc_option.click()
-
-        confirm_button = page.get_by_role(
+        confirm = page.get_by_role(
             "button",
             name="Confirm",
             exact=True,
         ).last
+        confirm.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        confirm.click()
 
-        confirm_button.wait_for(
-            state="visible",
-            timeout=DEFAULT_TIMEOUT,
-        )
+        processed.add(sku)
+        qc_results.append({
+            "sku": sku,
+            "classification": item_by_sku[sku]["classification"],
+            "qc_result": route,
+        })
 
-        confirm_button.click()
-
-        processed_skus.add(
-            sku
-        )
-
-        qc_results.append(
-            {
-                "sku": sku,
-                "classification": item_by_sku[sku][
-                    "classification"
-                ],
-                "qc_result": qc_result,
-            }
-        )
-
-        # Give Odoo a moment to close this QC dialog and automatically
-        # present the next SKU's QC dialog.
-        page.wait_for_timeout(
-            350
-        )
+        # Small handoff buffer while Odoo closes this QC and opens the next.
+        page.wait_for_timeout(350)
 
     return {
         "destination_location": None,
@@ -1127,39 +585,31 @@ def _process_open_box_or_defective(
     }
 
 
-
 def _return_group_key(item: dict):
-    """
-    Different Decision = different Odoo Return.
-    Classification/status are included because they change the stock route.
-    Grade and amount are Lark-only and do not require separate Odoo returns.
-    """
     return (
-        str(item.get("decision", "")).strip(),
-        str(item.get("classification", "")).strip(),
-        str(item.get("status", "")).strip(),
+        _text(item.get("decision")),
+        _text(item.get("classification")),
+        _text(item.get("status")),
     )
 
 
 def _build_return_groups(items: list[dict]) -> list[dict]:
-    groups = []
-    index_by_key = {}
+    groups_by_key = {}
+    order = []
 
     for item in items:
         key = _return_group_key(item)
-
-        if key not in index_by_key:
-            index_by_key[key] = len(groups)
-            groups.append({
+        if key not in groups_by_key:
+            groups_by_key[key] = {
                 "decision": key[0],
                 "classification": key[1],
                 "status": key[2],
                 "items": [],
-            })
+            }
+            order.append(key)
+        groups_by_key[key]["items"].append(item)
 
-        groups[index_by_key[key]]["items"].append(item)
-
-    return groups
+    return [groups_by_key[key] for key in order]
 
 
 def create_odoo_tickets(
@@ -1170,68 +620,41 @@ def create_odoo_tickets(
     progress_callback=None,
 ) -> dict:
     """
-    Create ONE Helpdesk ticket for the entire Shopee order.
-
-    Ticket title:
-        ORDER ID - SKU_QTY, SKU_QTY, SKU_QTY...
-
-    Product:
-        first returned SKU
-
-    Tags:
-        all unique item Odoo tags
-
-    Returns:
-        items with the same Decision + Classification + Status share one
-        Odoo Return. Different handling creates another Return on the same
-        ticket.
+    Create one Helpdesk ticket for the Shopee order and one or more stock
+    returns grouped by Decision + Classification + Status.
     """
+    order_id = _text(order_id)
     if not order_id:
         raise ValueError("Order ID is required.")
     if not returned_products:
         raise ValueError("No returned products were found.")
 
-    def progress(message):
-        if progress_callback:
-            progress_callback(message)
-        print(message)
-
-    # Validate currently supported physical return routes.
+    supported = {"New", "Unsealed", "Defective"}
     for item in returned_products:
-        classification = str(item.get("classification", "")).strip()
-        status = str(item.get("status", "")).strip()
+        classification = _text(item.get("classification"))
+        status = _text(item.get("status"))
 
-        if classification not in {"New", "Unsealed", "Defective"}:
+        if classification not in supported:
             raise NotImplementedError(
-                f"Odoo stock-return route is not implemented for "
+                "Odoo stock-return route is not implemented for "
                 f"{classification or 'blank classification'}."
             )
-
         if status != "Returned":
             raise NotImplementedError(
                 "Odoo stock-return processing currently requires "
                 "Status = Returned."
             )
 
-    ticket_title = build_ticket_title(
-        order_id,
-        returned_products,
-    )
-
-    first_sku = str(returned_products[0]["sku"]).strip()
-
-    tags = []
-    for item in returned_products:
-        tag = str(item.get("odoo_tag", "")).strip()
-        if tag and tag not in tags:
-            tags.append(tag)
+    ticket_title = build_ticket_title(order_id, returned_products)
+    first_sku = _text(returned_products[0]["sku"])
+    tags = _unique(item.get("odoo_tag") for item in returned_products)
 
     page = get_or_open_odoo_page(context)
     page.bring_to_front()
 
     if (
         "/odoo/helpdesk/3/tickets" not in page.url
-        or re.search(r"/tickets/\d+", page.url)
+        or _TICKET_URL_RE.search(page.url)
     ):
         page.goto(
             ODOO_TICKETS_URL,
@@ -1244,30 +667,35 @@ def create_odoo_tickets(
         timeout=SLOW_ODOO_TIMEOUT,
     )
 
-    progress(f"Creating one Odoo ticket: {ticket_title}")
+    _progress(progress_callback, f"Creating one Odoo ticket: {ticket_title}")
     _set_basic_ticket_fields(page, ticket_title)
 
-    progress("Saving new Odoo ticket...")
+    _progress(progress_callback, "Saving new Odoo ticket...")
     ticket_url = _create_and_open_ticket(page, ticket_title)
 
-    progress(f"Selecting first returned product: {first_sku}")
+    _progress(
+        progress_callback,
+        f"Selecting first returned product: {first_sku}",
+    )
     _select_product(page, first_sku)
 
-    progress("Adding Odoo tag(s): " + ", ".join(tags))
+    _progress(
+        progress_callback,
+        "Adding Odoo tag(s): " + ", ".join(tags),
+    )
     _select_tags(page, tags)
 
-    progress("Setting priority to Urgent...")
+    _progress(progress_callback, "Setting priority to Urgent...")
     _set_urgent_priority(page)
 
     groups = _build_return_groups(returned_products)
     return_results = []
 
-    for group_index, group in enumerate(groups, start=1):
-        # After the first return, Odoo is on the stock-picking page.
-        # Return to the SAME Helpdesk ticket before opening another Return.
-        if group_index > 1:
-            progress(
-                f"Returning to Helpdesk ticket for Return #{group_index}..."
+    for index, group in enumerate(groups, start=1):
+        if index > 1:
+            _progress(
+                progress_callback,
+                f"Returning to Helpdesk ticket for Return #{index}...",
             )
             page.goto(
                 ticket_url,
@@ -1284,37 +712,33 @@ def create_odoo_tickets(
             )
 
         item_text = ", ".join(
-            f"{item['sku']}_{item['quantity']}"
+            f"{_text(item['sku'])}_{int(item['quantity'])}"
             for item in group["items"]
         )
-
-        progress(
-            f"Creating Return #{group_index}: {item_text} | "
-            f"{group['classification']} | {group['decision']}"
+        _progress(
+            progress_callback,
+            f"Creating Return #{index}: {item_text} | "
+            f"{group['classification']} | {group['decision']}",
         )
 
-        _open_return_transfer(
-            page=page,
-            order_id=order_id,
-            items=group["items"],
-        )
+        _open_return_transfer(page, order_id, group["items"])
 
         if group["classification"] == "New":
             stock_result = _process_brand_new(page)
         else:
             stock_result = _process_open_box_or_defective(
-                page=page,
-                items=group["items"],
+                page,
+                group["items"],
             )
 
         return_results.append({
-            "return_index": group_index,
+            "return_index": index,
             "decision": group["decision"],
             "classification": group["classification"],
             "status": group["status"],
             "items": [
                 {
-                    "sku": str(item["sku"]).strip(),
+                    "sku": _text(item["sku"]),
                     "quantity": int(item["quantity"]),
                 }
                 for item in group["items"]
@@ -1322,9 +746,9 @@ def create_odoo_tickets(
             **stock_result,
         })
 
-        progress(
-            f"Return #{group_index} completed: "
-            f"{stock_result['transfer_id']}"
+        _progress(
+            progress_callback,
+            f"Return #{index} completed: {stock_result['transfer_id']}",
         )
 
     return {
