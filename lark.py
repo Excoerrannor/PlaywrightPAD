@@ -1,3 +1,4 @@
+import re
 from urllib.parse import quote, urlencode
 
 LARK_FORM_BASE_URL = (
@@ -75,31 +76,311 @@ def build_prefilled_lark_url(
 
 
 def get_or_open_lark_page(context):
-    for page in context.pages:
-        if not page.is_closed() and "shrlgCvlgAlYpqw3TAThRikY3ig" in page.url:
-            return page
+    """Create a fresh tab, as Lark prefills are unreliable on reused form tabs.
+
+    The tab stays inside the existing persistent Chrome profile, so Lark
+    sign-in remains available. A failed form is left open for inspection.
+    """
     return context.new_page()
 
 
-def _verify_prefilled_form(page, classification: str):
-    page.locator(
-        '#field-item-fldGfpOgy3 [contenteditable="true"]'
-    ).first.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+FIELD_IDS = {
+    "order_id": "fldGfpOgy3",
+    "sku": "fldZmVCLSz",
+    "quantity": "fldp1RHjbO",
+    "value": "fld7ICAkSy",
+    "classification": "fldc6INoIL",
+    "status": "flduWjJhXm",
+    "decision": "fldsuY8UMD",
+    "platform": "flde3CocnE",
+    "transfer_id": "fldLxm5LZH",
+    "transfer_link": "fldKACH12T",
+    "remarks": "fldxl8I6rt",
+    "grade": "fld6aPiebx",
+}
 
-    page.locator("#number-editor-input-fldp1RHjbO").wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
-    page.locator("#number-editor-input-fld7ICAkSy").wait_for(
-        state="visible",
-        timeout=DEFAULT_TIMEOUT,
-    )
 
-    if classification == "Unsealed":
-        page.locator("#field-item-fld6aPiebx").wait_for(
+def _field_card(page, field_id: str):
+    return page.locator(f"#field-item-{field_id}")
+
+
+def _clean_editor_text(value: str) -> str:
+    return _text(value).replace("\u200b", "").strip()
+
+
+def _wait_for_form_ready(page):
+    try:
+        _field_card(page, FIELD_IDS["order_id"]).wait_for(
             state="visible",
             timeout=SLOW_TIMEOUT,
         )
+    except Exception as error:
+        live_url = page.url
+        body_text = ""
+        try:
+            body_text = page.locator("body").inner_text(timeout=2_000)
+        except Exception:
+            pass
+        if "login" in live_url.lower() or "sign in" in body_text.lower():
+            raise RuntimeError(
+                "Lark is asking for login. Sign in to Lark in the processor "
+                "Chrome window, then press Submit again."
+            ) from error
+        raise RuntimeError(
+            "The Lark Item Returns form did not become ready."
+        ) from error
+
+
+def _text_editor(page, field_id: str):
+    editor = _field_card(page, field_id).locator(
+        '[contenteditable="true"]'
+    ).first
+    editor.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    return editor
+
+
+def _fill_text_field(page, field_id: str, value: str):
+    editor = _text_editor(page, field_id)
+    wanted = _text(value)
+    if _clean_editor_text(editor.inner_text()) != wanted:
+        editor.fill(wanted)
+
+
+def _fill_number_field(page, field_id: str, value):
+    input_box = _field_card(page, field_id).locator("input").first
+    input_box.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    current = _clean_editor_text(input_box.input_value()).replace(",", "")
+    try:
+        already_correct = float(current) == float(value)
+    except (TypeError, ValueError):
+        already_correct = False
+    if not already_correct:
+        input_box.fill(str(value))
+
+
+def _selected_option_values(card) -> list[str]:
+    """Read existing selections without clicking or toggling any option."""
+    return [
+        _clean_editor_text(value)
+        for value in card.locator(
+            ".base-component-select-list-editor-option-checked "
+            ".base-component-select-list-editor-text"
+        ).all_text_contents()
+        if _clean_editor_text(value)
+    ]
+
+
+def _select_option(page, field_id: str, option_text: str):
+    """Idempotent single-select: never click an already selected option.
+
+    Some Lark radio-style selectors toggle OFF when clicked a second time.
+    Exact matching also prevents 'Returned' matching 'Not Returned'.
+    """
+    option_text = _text(option_text)
+    if not option_text:
+        raise ValueError(f"A required Lark option for {field_id} is blank.")
+
+    card = _field_card(page, field_id)
+    card.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    if _selected_option_values(card) == [option_text]:
+        return
+
+    exact_label = re.compile(rf"^\s*{re.escape(option_text)}\s*$")
+    option = card.locator(
+        ".base-component-select-list-editor-option"
+    ).filter(has_text=exact_label).first
+    option.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+
+    # The async prefill can finish while locating the option. Check again.
+    if _selected_option_values(card) == [option_text]:
+        return
+    option.click()
+
+    selected = card.locator(
+        ".base-component-select-list-editor-option-checked "
+        ".base-component-select-list-editor-text"
+    ).filter(has_text=exact_label).first
+    try:
+        selected.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    except Exception as error:
+        actual = _selected_option_values(card)
+        raise RuntimeError(
+            f"Lark could not select {option_text!r} for {field_id}. "
+            f"Selected value(s): {actual!r}."
+        ) from error
+    if _selected_option_values(card) != [option_text]:
+        raise RuntimeError(
+            f"Lark {field_id} selection was not stable: "
+            f"{_selected_option_values(card)!r}."
+        )
+
+
+def _read_text_field(page, field_id: str) -> str:
+    return _clean_editor_text(_text_editor(page, field_id).inner_text())
+
+
+def _read_number_field(page, field_id: str) -> str:
+    input_box = _field_card(page, field_id).locator("input").first
+    input_box.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    return _clean_editor_text(input_box.input_value())
+
+
+def _read_selected_option(page, field_id: str) -> str:
+    selected = _field_card(page, field_id).locator(
+        ".base-component-select-list-editor-option-checked "
+        ".base-component-select-list-editor-text"
+    ).first
+    selected.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+    return _clean_editor_text(selected.inner_text())
+
+
+def _verify_form_values(page, expected: dict):
+    text_checks = {
+        "Order ID": (FIELD_IDS["order_id"], expected["order_id"]),
+        "SKU": (FIELD_IDS["sku"], expected["sku"]),
+        "Transfer ID": (FIELD_IDS["transfer_id"], expected["transfer_id"]),
+        "Transfer Link": (FIELD_IDS["transfer_link"], expected["transfer_link"]),
+        "Remarks": (FIELD_IDS["remarks"], expected["remarks"]),
+    }
+    for label, (field_id, wanted) in text_checks.items():
+        actual = _read_text_field(page, field_id)
+        if actual != _text(wanted):
+            raise RuntimeError(
+                f"Lark {label} verification failed. "
+                f"Expected {_text(wanted)!r}, got {actual!r}."
+            )
+
+    qty_actual = _read_number_field(page, FIELD_IDS["quantity"])
+    try:
+        qty_ok = int(float(qty_actual.replace(",", ""))) == int(expected["quantity"])
+    except (TypeError, ValueError):
+        qty_ok = False
+    if not qty_ok:
+        raise RuntimeError(
+            "Lark QTY verification failed. "
+            f"Expected {int(expected['quantity'])}, got {qty_actual!r}."
+        )
+
+    value_actual = _read_number_field(page, FIELD_IDS["value"])
+    try:
+        actual_value = float(value_actual.replace(",", ""))
+        expected_value = float(expected["value"])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Lark Value verification failed: {value_actual!r}."
+        ) from error
+    if abs(actual_value - expected_value) > 0.005:
+        raise RuntimeError(
+            "Lark Value verification failed. "
+            f"Expected {expected_value:.2f}, got {actual_value:.2f}."
+        )
+
+    select_checks = {
+        "Classification": (FIELD_IDS["classification"], expected["classification"]),
+        "Status": (FIELD_IDS["status"], expected["status"]),
+        "Decision": (FIELD_IDS["decision"], expected["decision"]),
+        "Platform": (FIELD_IDS["platform"], expected["platform"]),
+    }
+    for label, (field_id, wanted) in select_checks.items():
+        actual = _read_selected_option(page, field_id)
+        if actual != _text(wanted):
+            raise RuntimeError(
+                f"Lark {label} verification failed. "
+                f"Expected {_text(wanted)!r}, got {actual!r}."
+            )
+
+    if expected["classification"] == "Unsealed":
+        wanted_grade = _normalize_grade(expected["grade"])
+        actual_grade = _read_selected_option(page, FIELD_IDS["grade"])
+        if actual_grade != wanted_grade:
+            raise RuntimeError(
+                "Lark Grade verification failed. "
+                f"Expected {wanted_grade!r}, got {actual_grade!r}."
+            )
+
+
+def _fill_lark_form(page, expected: dict):
+    """Wait for URL prefill, fill any missing values, and verify everything."""
+    _wait_for_form_ready(page)
+
+    # Lark applies prefill asynchronously. A new tab often fills correctly
+    # after hydration; acting before that point can toggle values back off.
+    # If prefill did not arrive, continue to explicit field filling below.
+    try:
+        page.wait_for_function(
+            """expected => {
+                const editor = document.querySelector(
+                    '#field-item-fldGfpOgy3 [contenteditable="true"]'
+                );
+                const order_id = (editor?.textContent || '')
+                    .replace(/\u200b/g, '').trim();
+                const fieldIds = {
+                    classification: 'fldc6INoIL',
+                    status: 'flduWjJhXm',
+                    decision: 'fldsuY8UMD',
+                    platform: 'flde3CocnE',
+                };
+                return order_id === expected.order_id &&
+                    Object.entries(fieldIds).every(([name, id]) => {
+                        const selected = document.querySelector(
+                            '#field-item-' + id + ' ' +
+                            '.base-component-select-list-editor-option-checked ' +
+                            '.base-component-select-list-editor-text'
+                        );
+                        return (selected?.textContent || '').trim() === expected[name];
+                    });
+            }""",
+            arg={name: _text(expected[name]) for name in (
+                "order_id", "classification", "status", "decision", "platform"
+            )},
+            timeout=6_000,
+        )
+    except Exception:
+        # An incomplete prefill is not fatal: set only the missing fields.
+        print("LARK PREFILL: Incomplete after waiting; correcting form fields.")
+
+    # Select choices first because Classification can change conditional
+    # visibility (Grade) and may rerender part of the form.
+    _select_option(page, FIELD_IDS["classification"], expected["classification"])
+    _select_option(page, FIELD_IDS["status"], expected["status"])
+    _select_option(page, FIELD_IDS["decision"], expected["decision"])
+    _select_option(page, FIELD_IDS["platform"], expected["platform"])
+
+    if expected["classification"] == "Unsealed":
+        _field_card(page, FIELD_IDS["grade"]).wait_for(
+            state="visible", timeout=SLOW_TIMEOUT
+        )
+        _select_option(
+            page, FIELD_IDS["grade"], _normalize_grade(expected["grade"])
+        )
+
+    # Fill text/number values after select-driven rerenders are complete.
+    _fill_text_field(page, FIELD_IDS["order_id"], expected["order_id"])
+    _fill_text_field(page, FIELD_IDS["sku"], expected["sku"])
+    _fill_number_field(page, FIELD_IDS["quantity"], int(expected["quantity"]))
+    _fill_number_field(page, FIELD_IDS["value"], float(expected["value"]))
+    _fill_text_field(page, FIELD_IDS["transfer_id"], expected["transfer_id"])
+    _fill_text_field(page, FIELD_IDS["transfer_link"], expected["transfer_link"])
+    _fill_text_field(page, FIELD_IDS["remarks"], expected["remarks"])
+
+    _verify_form_values(page, expected)
+
+
+def _visible_form_errors(page) -> str:
+    messages = []
+    for selector in ('[class*="error"]', '[class*="invalid"]', '[role="alert"]'):
+        try:
+            locator = page.locator(selector)
+            for index in range(min(locator.count(), 20)):
+                node = locator.nth(index)
+                if not node.is_visible():
+                    continue
+                value = _clean_editor_text(node.inner_text(timeout=500))
+                if value and value not in messages:
+                    messages.append(value)
+        except Exception:
+            continue
+    return " | ".join(messages[:8])
 
 
 def file_lark_return(
@@ -142,18 +423,41 @@ def file_lark_return(
         timeout=SLOW_TIMEOUT,
     )
 
-    _verify_prefilled_form(page, classification)
+    expected = {
+        "order_id": order_id,
+        "sku": sku,
+        "quantity": quantity,
+        "value": value,
+        "classification": classification,
+        "status": status,
+        "decision": decision,
+        "platform": platform,
+        "transfer_id": transfer_id,
+        "transfer_link": transfer_link,
+        "remarks": remarks,
+        "grade": grade,
+    }
+    _progress(progress_callback, f"Filling and verifying Lark form for {sku}...")
+    _fill_lark_form(page, expected)
 
     button = page.get_by_role("button", name="File Return", exact=True)
     button.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    button.scroll_into_view_if_needed()
 
     _progress(progress_callback, f"Submitting Lark return for {sku}...")
     button.click()
 
-    page.get_by_text("Submitted", exact=True).first.wait_for(
-        state="visible",
-        timeout=SLOW_TIMEOUT,
-    )
+    submitted = page.get_by_text("Submitted", exact=True).first
+    try:
+        submitted.wait_for(state="visible", timeout=SLOW_TIMEOUT)
+    except Exception as error:
+        details = _visible_form_errors(page)
+        suffix = f" Visible form message(s): {details}" if details else ""
+        raise RuntimeError(
+            "Lark did not confirm the submission with the 'Submitted' page."
+            + suffix
+        ) from error
+
     _progress(
         progress_callback,
         f"Lark return submitted successfully for {sku}.",
@@ -183,17 +487,42 @@ def file_lark_return(
 
 def _refund_value(return_case: dict | None) -> float:
     if not return_case:
-        raise ValueError("Shopee return/refund data is required for Lark filing.")
+        raise ValueError("Return/refund data is required for Lark filing.")
     try:
         value = float(return_case["refund_value"])
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(
-            "Shopee refunded/order value is missing or invalid."
-        ) from error
+        raise ValueError("Return/refund value is missing or invalid.") from error
     if value < 0:
-        raise ValueError("Shopee refunded/order value cannot be negative.")
+        raise ValueError("Return/refund value cannot be negative.")
     return value
 
+
+def _value_source(return_case: dict | None) -> str:
+    if not return_case:
+        return "Return/refund value"
+    return _text(return_case.get("value_source")) or "Return/refund value"
+
+
+def _record_value(return_case: dict | None, items: list[dict]) -> float:
+    """
+    Shopee keeps the existing order/refund-total behavior.
+    Lazada can opt into item-level values by setting value_mode=item_amounts.
+    """
+    default_value = _refund_value(return_case)
+    if _text((return_case or {}).get("value_mode")) != "item_amounts":
+        return default_value
+
+    total = 0.0
+    for item in items:
+        sku = _text(item.get("sku"))
+        try:
+            amount = float(item.get("amount", 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid return amount for {sku or 'item'}.") from error
+        if amount < 0:
+            raise ValueError(f"Return amount for {sku or 'item'} cannot be negative.")
+        total += amount
+    return round(total, 2)
 
 def _build_returned_item_pool(items: list[dict]) -> list[dict]:
     pool = []
@@ -313,7 +642,7 @@ def _combine_transfer_remarks(items: list[dict]) -> str:
 def _transfer_record(
     transfer: dict,
     pool: list[dict],
-    refund_value: float,
+    return_case: dict | None,
     index: int,
 ) -> dict:
     transfer_id = _text(transfer.get("transfer_id"))
@@ -352,7 +681,7 @@ def _transfer_record(
             for item in items
         ),
         "quantity": sum(int(item["quantity"]) for item in items),
-        "value": refund_value,
+        "value": _record_value(return_case, items),
         "classification": classification,
         "status": status,
         "decision": decision,
@@ -364,6 +693,7 @@ def _transfer_record(
         "_meta": {
             "filing_type": "odoo_transfer",
             "transfer_index": index,
+            "value_source": _value_source(return_case),
             "items": [
                 {
                     "sku": _text(item.get("sku")),
@@ -375,14 +705,14 @@ def _transfer_record(
     }
 
 
-def _direct_record(item: dict, refund_value: float) -> dict:
+def _direct_record(item: dict, return_case: dict | None) -> dict:
     sku = _text(item.get("sku"))
     quantity = int(item.get("quantity", 0))
     return {
         "order_id": None,  # injected by caller
         "sku": sku,
         "quantity": quantity,
-        "value": refund_value,
+        "value": _record_value(return_case, [item]),
         "classification": _text(item.get("classification")),
         "status": _text(item.get("status")),
         "decision": _text(item.get("decision")),
@@ -393,6 +723,7 @@ def _direct_record(item: dict, refund_value: float) -> dict:
         "grade": _text(item.get("grade")),
         "_meta": {
             "filing_type": "not_returned_direct",
+            "value_source": _value_source(return_case),
             "items": [{"sku": sku, "quantity": quantity}],
         },
     }
@@ -415,7 +746,7 @@ def _submit_record(
     )
     result.update(meta)
     result["item_count"] = len(meta["items"])
-    result["value_source"] = "Shopee refunded/order value"
+    result["value_source"] = meta.get("value_source", "Return/refund value")
     return result
 
 
@@ -438,7 +769,7 @@ def file_lark_returns(
     if not returned_products:
         raise ValueError("No returned products are available for Lark filing.")
 
-    refund = _refund_value(return_case)
+    _refund_value(return_case)  # validate source value before any filing
     physically_returned = [
         item for item in returned_products
         if _text(item.get("status")) == RETURNED_STATUS
@@ -456,31 +787,42 @@ def file_lark_returns(
     transfers = odoo_results.get("returns", []) if odoo_results else []
     pool = _build_returned_item_pool(physically_returned)
 
-    page = get_or_open_lark_page(context)
-    page.bring_to_front()
     results = []
+    previous_success_page = None
+
+    def file_in_fresh_tab(record: dict) -> dict:
+        nonlocal previous_success_page
+        page = get_or_open_lark_page(context)
+        page.bring_to_front()
+        # On failure, leave this tab open for the operator to inspect.
+        result = _submit_record(page, record, order_id, progress_callback)
+        # Keep only the latest successful 'Submitted' tab open.
+        if previous_success_page is not None:
+            try:
+                if not previous_success_page.is_closed():
+                    previous_success_page.close()
+            except Exception:
+                pass
+        previous_success_page = page
+        return result
 
     for index, transfer in enumerate(transfers, start=1):
-        record = _transfer_record(transfer, pool, refund, index)
+        record = _transfer_record(transfer, pool, return_case, index)
         _progress(
             progress_callback,
             f"Filing Lark Transfer {index}/{len(transfers)}: "
             f"{record['transfer_id']} | {record['sku']}",
         )
-        results.append(
-            _submit_record(page, record, order_id, progress_callback)
-        )
+        results.append(file_in_fresh_tab(record))
 
     for index, item in enumerate(not_returned, start=1):
-        record = _direct_record(item, refund)
+        record = _direct_record(item, return_case)
         _progress(
             progress_callback,
             f"Filing direct Lark item {index}/{len(not_returned)}: "
             f"{record['sku']} | {record['status']}",
         )
-        results.append(
-            _submit_record(page, record, order_id, progress_callback)
-        )
+        results.append(file_in_fresh_tab(record))
 
     if not results:
         raise ValueError("No Lark filing records were generated.")

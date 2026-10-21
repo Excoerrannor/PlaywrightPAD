@@ -10,7 +10,13 @@ _TICKET_URL_RE = re.compile(
     r".*/odoo/helpdesk/3/tickets/\d+(?:[/?#].*)?$"
 )
 _TRANSFER_ID_RE = re.compile(r"TC/IN/\d+")
-_SKU_RE = re.compile(r"\[(MLE\d+)\]")
+_SKU_RE = re.compile(r"\[([A-Za-z0-9_+.-]+)\]")
+
+ODOO_CUSTOMER_BY_PLATFORM = {
+    "Shopee": "ECOMMERCE, SHOPEE",
+    "Lazada": "ECOMMERCE, LAZADA",
+    "TikTok": "ECOMMERCE, TIKTOK",
+}
 
 _RETURN_TABLE_JS = """
 rows => rows.map(row => {
@@ -85,7 +91,7 @@ def get_or_open_odoo_page(context):
     return page
 
 
-def _set_basic_ticket_fields(page, ticket_title: str):
+def _set_basic_ticket_fields(page, ticket_title: str, platform: str = "Shopee"):
     page.get_by_role("button", name="New").click()
 
     title = page.get_by_role("textbox", name="Ticket Title")
@@ -101,14 +107,29 @@ def _set_basic_ticket_fields(page, ticket_title: str):
         exact=True,
     ).click()
 
+    platform = _text(platform) or "Shopee"
+    customer_name = ODOO_CUSTOMER_BY_PLATFORM.get(
+        platform,
+        f"ECOMMERCE, {platform.upper()}",
+    )
+
     customer = page.get_by_role("combobox", name="Customer")
     customer.click()
-    customer.fill("Shop")
-    page.get_by_role(
+    customer.fill("Shop" if platform == "Shopee" else platform[:12])
+    option = page.get_by_role(
         "option",
-        name="ECOMMERCE, SHOPEE",
+        name=customer_name,
         exact=True,
-    ).click()
+    )
+    try:
+        option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        option.click()
+    except Exception as error:
+        raise RuntimeError(
+            f"Odoo customer {customer_name!r} was not found for platform "
+            f"{platform!r}. Update ODOO_CUSTOMER_BY_PLATFORM in odoo.py if "
+            "your Odoo customer name is different."
+        ) from error
 
 
 def _create_and_open_ticket(page, ticket_title: str) -> str:
@@ -617,10 +638,11 @@ def create_odoo_tickets(
     order_id: str,
     returned_products: list[dict],
     case_decision: dict | None = None,
+    platform: str = "Shopee",
     progress_callback=None,
 ) -> dict:
     """
-    Create one Helpdesk ticket for the Shopee order and one or more stock
+    Create one Helpdesk ticket for a marketplace order and one or more stock
     returns grouped by Decision + Classification + Status.
     """
     order_id = _text(order_id)
@@ -668,7 +690,7 @@ def create_odoo_tickets(
     )
 
     _progress(progress_callback, f"Creating one Odoo ticket: {ticket_title}")
-    _set_basic_ticket_fields(page, ticket_title)
+    _set_basic_ticket_fields(page, ticket_title, platform)
 
     _progress(progress_callback, "Saving new Odoo ticket...")
     ticket_url = _create_and_open_ticket(page, ticket_title)
@@ -756,6 +778,11 @@ def create_odoo_tickets(
         "ticket_url": ticket_url,
         "product_sku": first_sku,
         "tags": tags,
+        "platform": _text(platform) or "Shopee",
+        "customer": ODOO_CUSTOMER_BY_PLATFORM.get(
+            _text(platform) or "Shopee",
+            f"ECOMMERCE, {(_text(platform) or 'Shopee').upper()}",
+        ),
         "returns": return_results,
     }
 
