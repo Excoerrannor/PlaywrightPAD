@@ -283,7 +283,15 @@ def _extract_products_from_popover(popover) -> list[dict]:
                 const sku = skuMatch ? skuMatch[0] : skuText.split(/\s+/)[0];
                 if (!sku) continue;
 
-                const qtyMatch = full.match(/[×x]\s*(\d+)/i);
+                // Quantity is the dedicated direct sibling shown as `× 1`.
+                // Do NOT search the full product text for "x<number>" because
+                // variant names such as "RA 200x200x80 IP65" would incorrectly
+                // be parsed as a quantity of 200.
+                const qtyNode = [...container.children].find(node =>
+                    /^×\s*\d+$/.test(clean(node.textContent))
+                );
+                const qtyText = clean(qtyNode?.textContent);
+                const qtyMatch = qtyText.match(/^×\s*(\d+)$/);
                 const quantity = Number(qtyMatch?.[1] || 1);
                 let productName = "";
                 for (const node of lineNodes) {
