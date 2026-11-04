@@ -1,6 +1,11 @@
+import time
 from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 # Keep the existing folder so current marketplace/Odoo/Lark logins are preserved.
 # The same persistent Chrome profile stores Shopee, Lazada, and TikTok sessions.
@@ -209,6 +214,150 @@ class BrowserManager:
     # -----------------------------------------------------------------
     # Lazada
     # -----------------------------------------------------------------
+    def _finish_lazada_login(self, page):
+        """
+        Lazada sometimes redirects Return Orders to its sign-up landing page.
+        Click 'Log in' there (it opens a popup tab), then press the password
+        login form's 'Login' only if Chrome already filled both credentials.
+
+        Never read passwords for logging, never type/store a credential, and
+        never attempt to solve CAPTCHA/OTP challenges automatically.
+        Return the actual authenticated Return Orders Page (which may be a
+        different tab from `page`).
+        """
+        return_input = '#filters[name="filters"]'
+        signup_link_selector = 'a.to-login-link[data-spm="d_local_login"]'
+        login_form_selector = 'form.Login-password-login'
+        followed_signup_link = False
+        login_was_clicked = False
+        deadline = time.monotonic() + 45
+
+        while time.monotonic() < deadline:
+            if page.is_closed():
+                raise RuntimeError(
+                    "Lazada closed its login/return tab. Open Lazada again "
+                    "and retry the scan."
+                )
+
+            try:
+                if page.locator(return_input).is_visible():
+                    return page
+
+                signup_link = page.locator(signup_link_selector).first
+                if signup_link.is_visible():
+                    if followed_signup_link:
+                        raise RuntimeError(
+                            "Lazada redirected back to registration after login. "
+                            "Complete the login manually and retry the scan."
+                        )
+                    followed_signup_link = True
+                    # 'Log in' is an <a target='_blank'>, not the Login button.
+                    # Without expect_popup, the processor keeps the wrong tab.
+                    href = signup_link.get_attribute('href') or ''
+                    try:
+                        with page.expect_popup(timeout=8_000) as popup_info:
+                            signup_link.click(timeout=8_000)
+                        page = popup_info.value
+                        page.wait_for_load_state(
+                            'domcontentloaded', timeout=15_000
+                        )
+                    except PlaywrightTimeoutError:
+                        # Alternate layouts may navigate the same tab, or a
+                        # new tab may appear outside the popup event window.
+                        existing_login_tab = self._find_page(
+                            lambda url: (
+                                'sellercenter.lazada.com.ph' in url
+                                and '/apps/seller/login' in url
+                            )
+                        )
+                        if existing_login_tab:
+                            page = existing_login_tab
+                        elif '/apps/seller/login' not in page.url and href:
+                            page.goto(
+                                urljoin(page.url, href),
+                                wait_until='domcontentloaded',
+                            )
+                    continue
+
+                login_form = page.locator(login_form_selector).first
+                if login_form.is_visible():
+                    if not login_was_clicked:
+                        account = login_form.locator('#account').first
+                        password = login_form.locator('#password').first
+                        button = login_form.locator('button.login-button').first
+                        # Chrome autofill can be asynchronous. Wait a short
+                        # time for both values rather than clicking too early.
+                        credentials_ready = False
+                        for _ in range(30):
+                            try:
+                                credentials_ready = bool(
+                                    account.input_value(timeout=500).strip()
+                                    and password.input_value(timeout=500)
+                                )
+                            except PlaywrightError:
+                                credentials_ready = False
+                            if credentials_ready:
+                                break
+                            page.wait_for_timeout(200)
+                        if not credentials_ready:
+                            raise RuntimeError(
+                                "Lazada's login page is open, but the saved "
+                                "account/password were not both autofilled. "
+                                "Please log in manually in Chrome, then "
+                                "scan/search again."
+                            )
+                        if not button.is_enabled():
+                            raise RuntimeError(
+                                "Lazada Login is disabled or requires further "
+                                "verification. Complete it manually in Chrome, "
+                                "then scan/search again."
+                            )
+                        try:
+                            button.click(timeout=8_000)
+                        except PlaywrightError as error:
+                            raise RuntimeError(
+                                "Could not click Lazada Login. Complete login "
+                                "manually in Chrome, then scan/search again."
+                            ) from error
+                        login_was_clicked = True
+                        # Lazada usually redirects to the Return Orders URL
+                        # supplied in the original registration/login link.
+                        deadline = time.monotonic() + 35
+                    page.wait_for_timeout(250)
+                    continue
+
+                # For a successful login redirected to the Seller Center
+                # landing page instead of Return Orders, navigate back once.
+                # Do not navigate during verification or CAPTCHA challenges.
+                url = page.url.lower()
+                if login_was_clicked and any(
+                    route in url for route in (
+                        '/apps/home', '/seller/home', '/apps/dashboard'
+                    )
+                ):
+                    page.goto(
+                        LAZADA_RETURN_LIST_URL,
+                        wait_until='domcontentloaded',
+                    )
+                    login_was_clicked = False
+                    continue
+
+                page.wait_for_timeout(250)
+            except PlaywrightError:
+                # Lazada may replace the document during a redirect.
+                page.wait_for_timeout(250)
+
+        if login_was_clicked:
+            raise RuntimeError(
+                "Clicked Lazada Login, but Return Orders did not open. "
+                "Check the Chrome tab for an OTP, CAPTCHA, or login error; "
+                "complete it manually, then scan/search again."
+            )
+        raise RuntimeError(
+            "Lazada Return Orders did not finish loading. Check the Lazada "
+            "Chrome tab, complete any login prompt, then scan/search again."
+        )
+
     def get_lazada_return_page(self):
         """
         Find or open Lazada Seller Center's Return Orders page.
@@ -226,18 +375,23 @@ class BrowserManager:
             )
         )
         if exact:
-            return exact
+            page = exact
+        else:
+            # If Seller Center already has a login or registration tab, reuse
+            # it to retain Chrome's saved-login context.
+            lazada_page = self._find_page(
+                lambda url: "sellercenter.lazada.com.ph" in url
+            )
+            page = lazada_page or self._get_blank_page() or self.context.new_page()
+            page.goto(
+                LAZADA_RETURN_LIST_URL,
+                wait_until="domcontentloaded",
+            )
 
-        # If Lazada is already open on another Seller Center page, reuse that
-        # tab. This avoids opening a new tab every time a login redirect occurs.
-        lazada_page = self._find_page(
-            lambda url: "sellercenter.lazada.com.ph" in url
-        )
-        page = lazada_page or self._get_blank_page() or self.context.new_page()
-        page.goto(
-            LAZADA_RETURN_LIST_URL,
-            wait_until="domcontentloaded",
-        )
+        # Returns can redirect to /apps/register/registration. That page's
+        # 'Log in' opens another tab, which must be followed to avoid trying
+        # to search the original registration tab.
+        page = self._finish_lazada_login(page)
         page.bring_to_front()
         return page
 

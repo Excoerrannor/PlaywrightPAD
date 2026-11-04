@@ -11,8 +11,18 @@ from shopee import (
 )
 from lazada import get_lazada_return_order, suggested_processor_status
 from tiktok import get_tiktok_return_order
-from odoo import create_odoo_tickets
+from odoo import (
+    create_odoo_tickets,
+    resume_odoo_returns,
+    OdooWorkflowPausedError,
+)
 from lark import file_lark_returns
+from workflow_store import WorkflowStore
+from history_window import HistoryRecoveryWindow
+from ui_theme import (
+    apply_theme, RoundedCard, RoundedButton, configure_readonly_text, configure_transfer_entry,
+    INK, DEEP_TEAL, MUTED, TEAL_TINT, AMBER, TEAL,
+)
 ODOO_TAGS = [
     "Change of Mind (Sealed)",
     "Change of Mind (Unsealed)",
@@ -249,7 +259,15 @@ class ReturnProcessorApp(tk.Tk):
         self.case_decision = None
         # Odoo now returns one ticket containing one or more stock returns.
         self.odoo_results = None
+        # Safe restore point used when the Helpdesk ticket exists but the
+        # source inventory transaction is not ready for Odoo Return yet.
+        self.odoo_checkpoint = None
         self.lark_results = []
+        # Persistent JSON audit/recovery state.
+        self.workflow_store = WorkflowStore()
+        self.current_scan_id = None
+        self._processing_busy = False
+        self._history_window = None
         # In-place table editor.
         self.table_editor = None
         self.table_edit_item = None
@@ -257,8 +275,14 @@ class ReturnProcessorApp(tk.Tk):
         self.table_edit_original = None
         self.title("Makerlab Return Processor")
         self.geometry("1380x930")
-        self.minsize(1050, 760)
+        self.minsize(1000, 735)
+        self.ui_style = apply_theme(self)
+        self._responsive_mode = None
+        self._resize_job = None
         self.create_gui()
+        self.bind("<Configure>", self._schedule_responsive_layout)
+        self.after_idle(self._apply_responsive_layout)
+        self._refresh_restore_button()
         self.after(300, self.start_browser)
         self.protocol(
             "WM_DELETE_WINDOW",
@@ -270,44 +294,88 @@ class ReturnProcessorApp(tk.Tk):
 
     # =========================================================
     def create_gui(self):
-        ttk.Label(
-            self,
-            text="Makerlab Return Processor",
-            font=("Segoe UI", 18, "bold"),
-        ).pack(
-            pady=(18, 4),
+        # Keep the native window surface + Windhawk DWM backdrop untouched.
+        # The small colored bars and buttons are intentional accent surfaces.
+        toolbar = ttk.Frame(self, padding=(18, 8))
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="WORKSPACE", style="Toolbar.TLabel").pack(
+            side="left", padx=(0, 14)
         )
-        ttk.Label(
-            self,
-            text=(
-                "One marketplace order = one Odoo ticket. "
-                "Shopee, Lazada, and TikTok returns share the same Odoo + Lark workflow."
-            ),
-        ).pack(
-            pady=(0, 14),
+        self.history_toolbar_button = RoundedButton(
+            toolbar, text="Scan History", surface="dark", command=self.open_history_window
         )
-        main_frame = ttk.Frame(
-            self,
-            padding=18,
+        self.history_toolbar_button.pack(side="left", padx=(0, 8))
+        self.recovery_toolbar_button = RoundedButton(
+            toolbar, text="Recovery", surface="dark", command=self.open_recovery_window,
+            state="disabled",
         )
-        main_frame.pack(
-            fill="both",
-            expand=True,
+        self.recovery_toolbar_button.pack(side="left")
+        self.toolbar_hint = ttk.Label(
+            toolbar, text="Saved scans  /  Safe restore points", style="ToolbarHint.TLabel",
         )
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=0)
-        main_frame.rowconfigure(5, weight=1)
+        self.toolbar_hint.pack(side="right")
+
+        stripe = ttk.Frame(self, height=3)
+        stripe.pack(fill="x")
+        stripe.pack_propagate(False)
+        tk.Frame(stripe, bg=AMBER, width=100, height=3).pack(side="left", fill="y")
+        tk.Frame(stripe, bg=TEAL, height=3).pack(side="left", fill="both", expand=True)
+
+        hero = ttk.Frame(self, padding=(20, 8, 20, 7))
+        hero.pack(fill="x")
+        hero.columnconfigure(0, weight=1)
+        ttk.Label(hero, text="AFTERSALES  /  RETURN OPERATIONS", style="Kicker.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(hero, text="Makerlab Return Processor", style="Title.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(1, 1)
+        )
+        self.hero_subtitle = ttk.Label(
+            hero,
+            text="One marketplace order  •  One Odoo ticket  •  Odoo + Lark workflow",
+            style="Subtitle.TLabel",
+        )
+        self.hero_subtitle.grid(row=2, column=0, sticky="w")
+        self.hero_hint = ttk.Label(
+            hero, text="01  SCAN     02  REVIEW     03  ODOO     04  LARK",
+            style="Kicker.TLabel",
+        )
+        self.hero_hint.grid(row=1, column=1, sticky="e", padx=(15, 0))
+
+        # Native ttk scrolling viewport; deliberately NO Canvas, root bgcolor,
+        # alpha setting or Windows DWM override (preserves Windhawk glass).
+        self.body_viewport = ttk.Frame(self)
+        self.body_viewport.pack(fill="both", expand=True)
+        self.body_scrollbar = ttk.Scrollbar(
+            self.body_viewport, orient="vertical", command=self._scroll_body
+        )
+        self.body_scrollbar.pack(side="right", fill="y")
+        self._body_scroll_y = 0
+        self._body_scroll_max = 0
+        main_frame = ttk.Frame(self.body_viewport, padding=(18, 3, 18, 10))
+        main_frame.place(x=0, y=0, width=1000, height=760)
+        self.main_frame = main_frame
+        self.body_viewport.bind("<Configure>", self._schedule_body_geometry)
+        self.bind("<MouseWheel>", self._on_body_wheel)
+        self.bind("<Button-4>", self._on_body_wheel)
+        self.bind("<Button-5>", self._on_body_wheel)
+        main_frame.columnconfigure(0, weight=12)
+        main_frame.columnconfigure(1, weight=11)
+        main_frame.rowconfigure(7, weight=1)
         # -----------------------------------------------------
         # Marketplace Source
         # -----------------------------------------------------
-        source_frame = ttk.Frame(main_frame)
-        source_frame.grid(
+        source_panel = RoundedCard(
+            main_frame, title="01  FIND A MARKETPLACE RETURN"
+        )
+        source_panel.grid(
             row=0,
             column=0,
             columnspan=2,
             sticky="ew",
             pady=(0, 10),
         )
+        source_frame = source_panel.content
         source_frame.columnconfigure(3, weight=1)
 
         ttk.Label(source_frame, text="Platform:").grid(
@@ -346,17 +414,27 @@ class ReturnProcessorApp(tk.Tk):
             self.on_search_mode_changed,
         )
 
+        self.restore_workflow_button = RoundedButton(
+            source_frame,
+            text="Restore Pending",
+            command=self.restore_latest_workflow,
+            state="disabled",
+        )
+        self.restore_workflow_button.grid(
+            row=0, column=4, sticky="e", padx=(10, 0)
+        )
+
         self.order_input_label = ttk.Label(
             source_frame,
             text="Shopee Tracking Number:",
         )
         self.order_input_label.grid(
-            row=1, column=0, sticky="w", padx=(0, 6), pady=(8, 0)
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(5, 0)
         )
 
         self.order_url_entry = ttk.Entry(source_frame)
         self.order_url_entry.grid(
-            row=1, column=1, columnspan=3, sticky="ew", pady=(8, 0)
+            row=1, column=1, columnspan=3, sticky="ew", pady=(5, 0)
         )
         self.order_url_entry.bind(
             "<Return>",
@@ -367,37 +445,31 @@ class ReturnProcessorApp(tk.Tk):
             lambda _event: self.load_platform_order(),
         )
 
-        self.open_order_button = ttk.Button(
-            source_frame,
-            text="Search & Load",
+        self.open_order_button = RoundedButton(
+            source_frame, kind="teal", text="Search & Load",
             command=self.load_platform_order,
         )
         self.open_order_button.grid(
-            row=1, column=4, padx=(10, 0), pady=(8, 0)
+            row=1, column=4, padx=(10, 0), pady=(5, 0)
         )
-        ttk.Separator(
-            main_frame,
-            orient="horizontal",
-        ).grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(8, 14),
+        self.workspace_separator = ttk.Separator(main_frame, orient="horizontal")
+        self.workspace_separator.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 9),
         )
         # -----------------------------------------------------
         # Order Summary
         # -----------------------------------------------------
-        summary = ttk.Frame(
-            main_frame,
+        summary_panel = RoundedCard(
+            main_frame, title="02  RETURN OVERVIEW"
         )
-        summary.grid(
+        summary_panel.grid(
             row=3,
             column=0,
             columnspan=2,
             sticky="ew",
             pady=(0, 14),
         )
+        summary = summary_panel.content
         summary.columnconfigure(0, weight=1)
         summary.columnconfigure(1, weight=1)
         ttk.Label(
@@ -421,7 +493,7 @@ class ReturnProcessorApp(tk.Tk):
         self.order_id_label = SelectableValue(
             summary,
             text="Not loaded",
-            font=("Segoe UI", 13, "bold"),
+            style="Value.TEntry",
         )
         self.order_id_label.grid(
             row=1,
@@ -432,7 +504,7 @@ class ReturnProcessorApp(tk.Tk):
         self.product_value_label = SelectableValue(
             summary,
             text="Not loaded",
-            font=("Segoe UI", 13, "bold"),
+            style="Value.TEntry",
         )
         self.product_value_label.grid(
             row=1,
@@ -458,10 +530,9 @@ class ReturnProcessorApp(tk.Tk):
             pady=(8, 0),
         )
         self.transfer_id_label = HighlightedSelectableValue(
-            summary,
-            text="Not created yet",
-            font=("Segoe UI", 13, "bold"),
+            summary, text="Not created yet",
         )
+        configure_transfer_entry(self.transfer_id_label)
         self.transfer_id_label.grid(
             row=3,
             column=1,
@@ -472,29 +543,28 @@ class ReturnProcessorApp(tk.Tk):
         # -----------------------------------------------------
         # Returned Products Table
         # -----------------------------------------------------
-        ttk.Label(
+        self.items_heading = ttk.Label(
             main_frame,
-            text=(
-                "Returned Items — double-click SKU, QTY, or Amount to edit. "
-                "The same SKU may appear on multiple rows for different handling."
-            ),
-        ).grid(
+            text="03  RETURNED ITEMS   •   Double-click SKU, quantity or amount to edit",
+            style="Section.TLabel",
+        )
+        self.items_heading.grid(
             row=4,
             column=0,
             columnspan=2,
             sticky="w",
             pady=(0, 5),
         )
-        table_frame = ttk.Frame(
-            main_frame,
-        )
-        table_frame.grid(
+        table_panel = RoundedCard(main_frame, radius=18)
+        self.table_frame = table_panel
+        table_panel.grid(
             row=5,
             column=0,
             columnspan=2,
             sticky="nsew",
             pady=(0, 14),
         )
+        table_frame = table_panel.content
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
         columns = (
@@ -600,7 +670,7 @@ class ReturnProcessorApp(tk.Tk):
             sticky="e",
             pady=(8, 0),
         )
-        self.add_item_button = ttk.Button(
+        self.add_item_button = RoundedButton(
             item_list_actions,
             text="Add Item",
             command=self.add_return_item,
@@ -608,7 +678,7 @@ class ReturnProcessorApp(tk.Tk):
         self.add_item_button.pack(
             side="left",
         )
-        self.remove_item_button = ttk.Button(
+        self.remove_item_button = RoundedButton(
             item_list_actions,
             text="Remove Selected",
             command=self.remove_selected_item,
@@ -621,18 +691,17 @@ class ReturnProcessorApp(tk.Tk):
         # -----------------------------------------------------
         # Selected Item Decision
         # -----------------------------------------------------
-        self.item_frame = ttk.LabelFrame(
-            main_frame,
-            text="Selected Item Decision",
-            padding=12,
+        self.item_panel = RoundedCard(
+            main_frame, title="04  SELECTED ITEM  /  DECISION"
         )
-        self.item_frame.grid(
+        self.item_panel.grid(
             row=6,
             column=0,
             columnspan=2,
             sticky="ew",
             pady=(0, 12),
         )
+        self.item_frame = self.item_panel.content
         for column in (1, 3, 5):
             self.item_frame.columnconfigure(
                 column,
@@ -773,22 +842,32 @@ class ReturnProcessorApp(tk.Tk):
             sticky="ew",
             pady=4,
         )
+        # Capture existing label/input pairs without changing callback bindings.
+        self._item_form_pairs = [
+            (self.item_frame.grid_slaves(row=0, column=0)[0], self.amount_entry),
+            (self.item_frame.grid_slaves(row=0, column=2)[0], self.classification_combo),
+            (self.item_frame.grid_slaves(row=0, column=4)[0], self.odoo_tag_combo),
+            (self.item_frame.grid_slaves(row=1, column=0)[0], self.decision_combo),
+            (self.item_frame.grid_slaves(row=1, column=2)[0], self.return_status_combo),
+            (self.item_frame.grid_slaves(row=1, column=4)[0], self.grade_combo),
+        ]
         # Remarks
-        ttk.Label(
+        self.remarks_label = ttk.Label(
             self.item_frame,
             text="Remarks:",
-        ).grid(
-            row=2,
-            column=0,
-            sticky="nw",
-            padx=(0, 6),
-            pady=4,
+        )
+        self.remarks_label.grid(
+            row=2, column=0, sticky="nw", padx=(0, 6), pady=4,
         )
         self.remarks_text = tk.Text(
             self.item_frame,
-            height=3,
+            height=2,
             wrap="word",
             state="disabled",
+            bg="#FFFFFF", fg=INK, insertbackground=INK,
+            selectbackground=DEEP_TEAL, selectforeground="#FFFFFF",
+            relief="flat", highlightthickness=1,
+            highlightbackground="#B9D2D5",
         )
         self.remarks_text.grid(
             row=2,
@@ -797,17 +876,16 @@ class ReturnProcessorApp(tk.Tk):
             sticky="ew",
             pady=4,
         )
-        item_actions = ttk.Frame(
-            self.item_frame,
-        )
+        item_actions = ttk.Frame(self.item_frame, style="Card.TFrame")
+        self.item_actions = item_actions
         item_actions.grid(
             row=3,
             column=0,
             columnspan=6,
-            sticky="e",
+            sticky="ew",
             pady=(10, 0),
         )
-        self.save_item_button = ttk.Button(
+        self.save_item_button = RoundedButton(
             item_actions,
             text="Save Item Decision",
             command=self.save_selected_item,
@@ -816,7 +894,7 @@ class ReturnProcessorApp(tk.Tk):
         self.save_item_button.pack(
             side="left",
         )
-        self.apply_all_button = ttk.Button(
+        self.apply_all_button = RoundedButton(
             item_actions,
             text="Apply Decision to All Items",
             command=self.apply_selected_decision_to_all,
@@ -826,7 +904,7 @@ class ReturnProcessorApp(tk.Tk):
             side="left",
             padx=(8, 0),
         )
-        self.confirm_decision_button = ttk.Button(
+        self.confirm_decision_button = RoundedButton(
             item_actions,
             text="Confirm All Items",
             command=self.confirm_decision,
@@ -836,23 +914,33 @@ class ReturnProcessorApp(tk.Tk):
             side="left",
             padx=(8, 0),
         )
-        self.submit_button = ttk.Button(
-            item_actions,
-            text="Submit",
-            command=self.submit_case,
-            state="disabled",
+        self.submit_button = RoundedButton(
+            item_actions, kind="amber", text="Submit to Odoo + Lark",
+            command=self.submit_case, state="disabled",
         )
         self.submit_button.pack(
             side="left",
             padx=(8, 0),
         )
+        self.resume_odoo_button = RoundedButton(
+            item_actions, kind="teal", text="Retry Odoo Return & Continue",
+            command=self.resume_odoo_workflow, state="disabled",
+        )
+        self.resume_odoo_button.pack(
+            side="left", padx=(8, 0),
+        )
+        self._decision_actions = [
+            self.save_item_button, self.apply_all_button,
+            self.confirm_decision_button, self.submit_button,
+            self.resume_odoo_button,
+        ]
         # -----------------------------------------------------
         # Status / Results
         # -----------------------------------------------------
-        ttk.Label(
-            main_frame,
-            text="Status:",
-        ).grid(
+        self.status_heading = ttk.Label(
+            main_frame, text="CURRENT STATUS", style="Section.TLabel",
+        )
+        self.status_heading.grid(
             row=7,
             column=0,
             columnspan=2,
@@ -868,23 +956,17 @@ class ReturnProcessorApp(tk.Tk):
             relief="solid",
         )
         self.status_label.grid(
-            row=8,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(3, 8),
+            row=8, column=0, columnspan=2, sticky="ew", pady=(3, 8),
         )
-        ttk.Button(
-            main_frame,
-            text="Copy All Case Details",
+        configure_readonly_text(self.status_label)
+
+        self.copy_all_button = RoundedButton(
+            main_frame, text="Copy All Case Details", surface="dark",
             command=self.copy_case_details,
-        ).grid(
-            row=7, column=1, sticky="e"
         )
-        self.odoo_result_frame = ttk.LabelFrame(
-            main_frame,
-            text="Odoo / Lark Result",
-            padding=10,
+        self.copy_all_button.grid(row=7, column=1, sticky="e")
+        self.odoo_result_frame = RoundedCard(
+            main_frame, title="05  ODOO  /  LARK ACTIVITY"
         )
         self.odoo_result_frame.grid(
             row=9,
@@ -892,18 +974,19 @@ class ReturnProcessorApp(tk.Tk):
             columnspan=2,
             sticky="ew",
         )
-        result_container = ttk.Frame(self.odoo_result_frame)
-        result_container.pack(fill="x", anchor="w")
+        result_container = ttk.Frame(self.odoo_result_frame.content, style="Card.TFrame")
+        result_container.pack(fill="both", expand=True, anchor="w")
         self.odoo_result_label = SelectableText(
             result_container,
             text="No submission completed yet.",
-            height=3,
+            height=4,
             padx=6,
             pady=3,
             borderwidth=1,
             relief="solid",
         )
         self.odoo_result_label.pack(side="left", fill="both", expand=True)
+        configure_readonly_text(self.odoo_result_label, detail=True)
         result_scrollbar = ttk.Scrollbar(
             result_container,
             orient="vertical",
@@ -911,6 +994,152 @@ class ReturnProcessorApp(tk.Tk):
         )
         result_scrollbar.pack(side="right", fill="y")
         self.odoo_result_label.configure(yscrollcommand=result_scrollbar.set)
+        self._arrange_workspace_columns()
+        self.after_idle(self._update_body_geometry)
+
+    def _schedule_body_geometry(self, _event=None):
+        if not hasattr(self, "main_frame"):
+            return
+        if getattr(self, "_geometry_job", None):
+            self.after_cancel(self._geometry_job)
+        self._geometry_job = self.after_idle(self._update_body_geometry)
+
+    def _update_body_geometry(self):
+        self._geometry_job = None
+        if not hasattr(self, "main_frame") or not self.main_frame.winfo_exists():
+            return
+        view_height = max(1, self.body_viewport.winfo_height())
+        view_width = max(1, self.body_viewport.winfo_width() - self.body_scrollbar.winfo_width())
+        # Use the natural requested height, not the clipped visible height.
+        content_height = max(view_height, self.main_frame.winfo_reqheight())
+        self._body_scroll_max = max(0, content_height - view_height)
+        self._body_scroll_y = min(self._body_scroll_y, self._body_scroll_max)
+        current = self.main_frame.place_info()
+        if (int(current.get("width", 0)) != view_width
+                or int(current.get("height", 0)) != content_height
+                or int(current.get("y", 0)) != -self._body_scroll_y):
+            self.main_frame.place_configure(
+                x=0, y=-self._body_scroll_y, width=view_width, height=content_height
+            )
+        start = self._body_scroll_y / content_height
+        end = min(1, (self._body_scroll_y + view_height) / content_height)
+        self.body_scrollbar.set(start, end)
+
+    def _scroll_body(self, *args):
+        if not args:
+            return
+        if args[0] == "moveto":
+            next_y = round(float(args[1]) * (self._body_scroll_max + self.body_viewport.winfo_height()))
+        elif args[0] == "scroll":
+            amount = int(args[1])
+            unit = round(self.body_viewport.winfo_height() * 0.8) if args[2] == "pages" else 40
+            next_y = self._body_scroll_y + amount * unit
+        else:
+            return
+        self._body_scroll_y = min(max(0, next_y), self._body_scroll_max)
+        self._update_body_geometry()
+
+    def _on_body_wheel(self, event):
+        if event.widget.winfo_toplevel() is not self or self._body_scroll_max <= 0:
+            return
+        # Keep native row/text mouse-wheel scrolling in the item/results views.
+        if isinstance(event.widget, (ttk.Treeview, tk.Text, ttk.Combobox)):
+            return
+        delta = -1 if getattr(event, "num", 0) == 5 else (1 if getattr(event, "num", 0) == 4 else 0)
+        if not delta:
+            delta = int(getattr(event, "delta", 0) / 120)
+        if delta:
+            self._scroll_body("scroll", -delta, "units")
+            return "break"
+
+    def _arrange_workspace_columns(self):
+        """Two work areas: readable item list left, form and results right.
+
+        Avoids the old vertical stack collapsing the item table to 1 pixel.
+        Widgets are only re-gridded; all old callbacks and values survive.
+        """
+        panel = self.main_frame
+        for row in range(10):
+            panel.rowconfigure(row, weight=1 if row == 7 else 0)
+        self.source_frame = panel.grid_slaves(row=0, column=0)[0]
+        self.source_frame.grid_configure(row=0, column=0, columnspan=2, pady=(0, 7), sticky="ew")
+        self.workspace_separator.grid_configure(row=1, column=0, columnspan=2, pady=(1, 8))
+        self.summary_frame = panel.grid_slaves(row=3, column=0)[0]
+        self.summary_frame.grid_configure(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 11))
+        self.items_heading.grid_configure(row=3, column=0, sticky="nw", pady=(0, 5))
+        self.table_frame.grid_configure(row=4, column=0, rowspan=5, columnspan=1,
+                                        sticky="nsew", pady=(0, 0), padx=(0, 13))
+        self.item_panel.grid_configure(row=4, column=1, rowspan=1, columnspan=1,
+                                       sticky="new", pady=(0, 9), padx=(8, 0))
+        self.status_heading.grid_configure(row=5, column=1, columnspan=1, sticky="w")
+        self.status_label.grid_configure(row=6, column=1, columnspan=1,
+                                         sticky="ew", pady=(3, 7))
+        self.odoo_result_frame.grid_configure(row=7, column=1, columnspan=1,
+                                              sticky="nsew", pady=(0, 7))
+        self.copy_all_button.grid_configure(row=8, column=1, sticky="e", pady=(0, 1))
+
+    def _schedule_responsive_layout(self, event):
+        """Coalesce high-frequency Windows resize events; only reposition widgets."""
+        if event.widget is not self:
+            return
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(90, self._apply_responsive_layout)
+
+    def _apply_responsive_layout(self):
+        self._resize_job = None
+        if not hasattr(self, "_item_form_pairs"):
+            return
+        width = self.winfo_width()
+        mode = "wide" if width >= 1250 else "compact"
+        if mode == self._responsive_mode:
+            return
+        self._responsive_mode = mode
+        # The right review panel is approx. half the window; two field groups
+        # per row keep labels readable while the left SKU table stays visible.
+        pairs_per_row = 2
+        for col in range(6):
+            self.item_frame.columnconfigure(col, weight=1 if col in (1,3) else 0)
+        # Old 6-column frame contains unused columns 4+5 at this breakpoint.
+        # All fields use columns 0..3, remarks and buttons span those columns.
+        for index, (label, widget) in enumerate(self._item_form_pairs):
+            row = index // pairs_per_row
+            pair_column = index % pairs_per_row
+            label.grid_configure(row=row, column=pair_column * 2,
+                                 sticky="w", padx=(6 if pair_column else 0, 4), pady=3)
+            widget.grid_configure(row=row, column=pair_column * 2 + 1,
+                                  sticky="ew", padx=0, pady=3)
+        next_row = 3
+        self.remarks_label.grid_configure(row=next_row, column=0, sticky="nw")
+        self.remarks_text.grid_configure(row=next_row, column=1, columnspan=3, sticky="ew")
+        self.item_actions.grid_configure(row=next_row+1, column=0, columnspan=4, sticky="ew")
+        # Responsive actions: two equal-width columns and a full-width
+        # Retry button. In compact mode the critical confirmation and submit
+        # actions receive their own rows so labels never get clipped.
+        self.item_actions.columnconfigure(0, weight=1, uniform="decision_action")
+        self.item_actions.columnconfigure(1, weight=1, uniform="decision_action")
+        for action in self._decision_actions:
+            action.pack_forget()
+            action.grid_forget()
+        if mode == "wide":
+            positions = (
+                (0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1), (2, 0, 2),
+            )
+        else:
+            positions = (
+                (0, 0, 1), (0, 1, 1), (1, 0, 2), (2, 0, 2), (3, 0, 2),
+            )
+        for button, (row, column, span) in zip(self._decision_actions, positions):
+            button.grid(row=row, column=column, columnspan=span,
+                        sticky="ew", padx=(4, 4), pady=(0 if row == 0 else 7, 0))
+        if mode == "wide":
+            self.hero_hint.grid()
+            if not self.toolbar_hint.winfo_manager():
+                self.toolbar_hint.pack(side="right")
+        else:
+            self.hero_hint.grid_remove()
+            self.toolbar_hint.pack_forget()
+        self._schedule_body_geometry()
 
     # =========================================================
     # BROWSER / SHOPEE
@@ -920,9 +1149,21 @@ class ReturnProcessorApp(tk.Tk):
         self.set_status("Opening Playwright browser...")
         try:
             self.browser.start()
-            self.set_status(
-                "Browser ready. Choose Shopee, Lazada, or TikTok and load a return."
-            )
+            pending_count = len(self.workflow_store.list_restore_points())
+            warning = self.workflow_store.last_warning
+            if pending_count:
+                self.set_status(
+                    f"Browser ready. {pending_count} pending workflow(s) can be restored "
+                    "with Restore Pending."
+                )
+            elif warning:
+                self.set_status(
+                    "Browser ready. JSON recovery warning: " + warning
+                )
+            else:
+                self.set_status(
+                    "Browser ready. Choose Shopee, Lazada, or TikTok and load a return."
+                )
         except Exception as error:
             self.set_status("Could not start browser.")
             messagebox.showerror("Browser Error", str(error))
@@ -1230,6 +1471,7 @@ class ReturnProcessorApp(tk.Tk):
             state="normal" if items else "disabled"
         )
         self.set_status(status_message)
+        self._record_loaded_scan()
 
     def process_order_page(self, page, known_return_case=None):
         """Load a Shopee order and merge Order-page + Return-list data."""
@@ -1323,16 +1565,20 @@ class ReturnProcessorApp(tk.Tk):
 
         items = []
         manual_status_count = 0
+        mixed_status_count = 0
         for raw in data.get("items") or []:
             status = suggested_processor_status(raw)
             if not status:
                 manual_status_count += 1
+            if raw.get("mixed_delivery_status"):
+                mixed_status_count += 1
 
             refund_amount = float(raw.get("refund_amount") or 0)
+            qty = int(raw.get("quantity") or 1)
             item = self._new_item_record(
                 sku=raw.get("sku", ""),
-                quantity=int(raw.get("quantity") or 1),
-                unit_price=refund_amount,
+                quantity=qty,
+                unit_price=(round(refund_amount / qty, 4) if qty else ""),
                 amount=refund_amount,
                 platform="Lazada",
                 status=status,
@@ -1343,20 +1589,31 @@ class ReturnProcessorApp(tk.Tk):
         if not items:
             raise ValueError("No Lazada return items were found for this order.")
 
+        total_units = sum(item["quantity"] for item in items)
+        source_count = int(data.get("source_item_count") or total_units)
         warning_parts = [
-            "Lazada QTY defaults to 1 per Return Item ID because the list does "
-            "not expose quantity; verify/edit QTY before Confirm All Items."
+            "Repeated Lazada Return Item IDs sharing a SKU are grouped. "
+            "QTY counts their units and Amount is the SUM of refund amounts. "
+            "Lazada's list assumes QTY 1 per source Return Item ID; verify "
+            "the total before confirming."
         ]
         if manual_status_count:
             warning_parts.append(
-                f"{manual_status_count} item(s) are not clearly delivered to the "
+                f"{manual_status_count} SKU group(s) are not clearly delivered to the "
                 "seller, so Status was left blank for manual confirmation."
+            )
+        if mixed_status_count:
+            warning_parts.append(
+                f"{mixed_status_count} SKU group(s) contain units with differing "
+                "delivery status. Split into separate rows if their return "
+                "handling is different."
             )
 
         self._show_loaded_items(
             items,
             (
-                f"Lazada return loaded: {order_id} | {len(items)} item(s) | "
+                f"Lazada return loaded: {order_id} | {len(items)} unique SKU(s) | "
+                f"QTY {total_units} from {source_count} Return Item ID row(s) | "
                 f"Return Order ID {data.get('return_order_id') or 'N/A'} | "
                 f"Searched by {data.get('search_by') or 'Order ID'}. "
                 + " ".join(warning_parts)
@@ -1367,8 +1624,9 @@ class ReturnProcessorApp(tk.Tk):
         for item in items:
             src = item.get("source_data", {})
             print(
-                f"{item['sku']} | Return Item {src.get('return_item_id', '')} | "
-                f"Refund {item['amount']:.2f} | {src.get('source_status', '')} | "
+                f"{item['sku']} | QTY {item['quantity']} | "
+                f"Return Item IDs {', '.join(src.get('return_item_ids') or [])} | "
+                f"Total Refund {item['amount']:.2f} | {src.get('source_status', '')} | "
                 f"{src.get('return_reason', '')}"
             )
 
@@ -1472,6 +1730,321 @@ class ReturnProcessorApp(tk.Tk):
             )
 
     # =========================================================
+    # JSON HISTORY / RECOVERY
+    # =========================================================
+    def _record_loaded_scan(self):
+        """Create one permanent history entry for each successful marketplace load."""
+        try:
+            self.current_scan_id = self.workflow_store.start_scan(
+                platform=self.current_platform,
+                search_by=self.current_search_mode,
+                search_input=self.order_url_entry.get().strip(),
+                order_id=self.current_order_id,
+                return_case=self.return_case or {},
+                items=self.returned_products,
+            )
+            self._refresh_restore_button()
+        except Exception as error:
+            # Persistence must never block marketplace processing.
+            print(f"JSON scan-history save failed: {error}")
+
+    def _workflow_snapshot(self, workflow_state, last_error=""):
+        return {
+            "workflow_state": workflow_state,
+            "platform": self.current_platform,
+            "search_by": self.current_search_mode,
+            "search_input": self.order_url_entry.get().strip(),
+            "order_id": self.current_order_id or "",
+            "return_case": copy.deepcopy(self.return_case or {}),
+            "items": copy.deepcopy(self.returned_products),
+            "case_decision": copy.deepcopy(self.case_decision),
+            "odoo_results": copy.deepcopy(self.odoo_results),
+            "odoo_checkpoint": copy.deepcopy(self.odoo_checkpoint),
+            "lark_results": copy.deepcopy(self.lark_results),
+            "transfer_display": self.transfer_id_label.cget("text"),
+            "status_text": self.status_label.cget("text"),
+            "last_error": str(last_error or ""),
+        }
+
+    def _persist_workflow(self, workflow_state, *, keep_restore, last_error=""):
+        """Update scan history and optionally keep an on-disk resume snapshot."""
+        if not self.current_scan_id:
+            return
+        snapshot = self._workflow_snapshot(workflow_state, last_error=last_error)
+        try:
+            self.workflow_store.update_scan(
+                self.current_scan_id,
+                workflow_state=workflow_state,
+                items=snapshot["items"],
+                case_decision=snapshot["case_decision"],
+                odoo_results=snapshot["odoo_results"],
+                odoo_checkpoint=snapshot["odoo_checkpoint"],
+                lark_results=snapshot["lark_results"],
+                last_error=snapshot["last_error"],
+                return_case=snapshot["return_case"],
+            )
+            if keep_restore:
+                self.workflow_store.save_restore_point(
+                    self.current_scan_id,
+                    snapshot,
+                )
+            else:
+                self.workflow_store.delete_restore_point(self.current_scan_id)
+        except Exception as error:
+            # Do not interrupt Odoo/Lark solely because the local audit file failed.
+            print(f"JSON workflow save failed: {error}")
+        finally:
+            self._refresh_restore_button()
+
+    def _refresh_restore_button(self, busy=False):
+        """Refresh both top-toolbar and existing in-form recovery shortcuts."""
+        if not hasattr(self, "restore_workflow_button"):
+            return
+        try:
+            count = len(self.workflow_store.list_restore_points())
+        except Exception as error:
+            print(f"Could not read restore points: {error}")
+            count = 0
+        is_busy = bool(busy or self._processing_busy)
+        button_state = "normal" if count and not is_busy else "disabled"
+        label = f"Recovery ({count})" if count else "Recovery"
+        self.recovery_toolbar_button.config(text=label, state=button_state)
+        self.history_toolbar_button.config(state="disabled" if is_busy else "normal")
+        self.restore_workflow_button.config(
+            text=(f"Browse Pending ({count})" if count else "Browse Pending"),
+            state=button_state,
+        )
+        window = self._history_window
+        if window is not None and window.winfo_exists():
+            window.refresh_from_store()
+
+    def open_recovery_window(self):
+        """Open all pending cases so the operator can select one to resume."""
+        self.open_history_window(pending_only=True)
+
+    def open_history_window(self, pending_only=False):
+        """Show a single non-modal history and recovery browser."""
+        if self._processing_busy:
+            messagebox.showwarning(
+                "Processor Busy", "Wait for the current submission to finish."
+            )
+            return
+        window = self._history_window
+        if window is not None and window.winfo_exists():
+            if pending_only:
+                window.status_var.set("Pending / Recoverable")
+            window.refresh_from_store()
+            window.lift()
+            window.focus_set()
+            return
+        self._history_window = HistoryRecoveryWindow(
+            self,
+            store=self.workflow_store,
+            on_restore=self.restore_saved_workflow,
+            pending_only=pending_only,
+        )
+
+    def restore_latest_workflow(self):
+        """Compatibility shortcut: show the picker instead of auto-restoring."""
+        self.open_recovery_window()
+
+    def restore_saved_workflow(self, scan_id):
+        """Load one selected JSON checkpoint without touching Odoo or Lark."""
+        if self._processing_busy:
+            messagebox.showwarning(
+                "Processor Busy", "Wait for the current submission to finish."
+            )
+            return False
+        try:
+            snapshot = self.workflow_store.get_restore_point(scan_id)
+        except Exception as error:
+            messagebox.showerror("Restore Error", str(error))
+            return False
+        if not snapshot:
+            messagebox.showwarning(
+                "No Restore Point", "This case has no active saved checkpoint."
+            )
+            return False
+        if snapshot.get("workflow_state") == "completed":
+            messagebox.showwarning(
+                "Completed Case", "Completed history entries cannot be restored."
+            )
+            return False
+        order_id = str(snapshot.get("order_id") or "").strip()
+        items = snapshot.get("items")
+        if not order_id or not isinstance(items, list) or not items:
+            messagebox.showerror(
+                "Invalid Restore Point",
+                "The saved case is missing an Order ID or return items. "
+                "No current work was changed.",
+            )
+            return False
+        # Fail closed when a checkpoint is incomplete: never offer Submit in a
+        # state that might recreate an already-existing Odoo Helpdesk ticket.
+        state = str(snapshot.get("workflow_state") or "confirmed")
+        checkpoint = snapshot.get("odoo_checkpoint")
+        odoo_result = snapshot.get("odoo_results")
+        returned_items = any(
+            isinstance(item, dict) and item.get("status") == RETURNED_STATUS
+            for item in items
+        )
+        if (
+            (state in {"odoo_return_pending", "manual_review"} and not checkpoint)
+            or (state == "lark_pending" and returned_items and not odoo_result)
+            or (state in {"odoo_return_pending", "manual_review", "lark_pending"}
+                and not snapshot.get("case_decision"))
+        ):
+            messagebox.showerror(
+                "Incomplete Restore Point",
+                "This saved workflow is missing an Odoo checkpoint/result or "
+                "the confirmed item decisions. It cannot safely resume "
+                "automatically. Review the existing Odoo work manually."
+            )
+            return False
+        if self.current_scan_id == scan_id and self.current_order_id:
+            messagebox.showinfo(
+                "Already Open",
+                "This workflow is already open in the processor. Continue "
+                "using its Submit or Retry Odoo Return & Continue button.",
+            )
+            return False
+
+        if self.current_order_id:
+            active_pending = bool(
+                self.case_decision and not self.lark_results
+            )
+            if active_pending:
+                try:
+                    existing_snapshot = self.workflow_store.get_restore_point(
+                        self.current_scan_id
+                    )
+                except Exception:
+                    existing_snapshot = None
+                if not existing_snapshot:
+                    messagebox.showwarning(
+                        "Cannot Switch Safely",
+                        "The current workflow has confirmed work but no "
+                        "saved restore point. Finish or save it first."
+                    )
+                    return False
+                prompt = (
+                    f"The current order {self.current_order_id} has an "
+                    "unfinished workflow saved in JSON.\n\n"
+                    f"Switch to order {order_id}? Any unconfirmed on-screen "
+                    "edits to the current case will be discarded."
+                )
+            else:
+                prompt = (
+                    f"Replace the currently displayed order "
+                    f"{self.current_order_id} with saved order {order_id}?\n\n"
+                    "Any unsaved edits to the current screen will be discarded."
+                )
+            if not messagebox.askyesno(
+                "Switch Saved Workflow", prompt, parent=self
+            ):
+                return False
+
+        try:
+            self._load_restored_snapshot(snapshot)
+        except Exception as error:
+            messagebox.showerror("Restore Error", str(error))
+            return False
+        return True
+
+    def _load_restored_snapshot(self, snapshot):
+        """Restore UI and idempotency state; never submit automatically."""
+        state = str(snapshot.get("workflow_state") or "confirmed")
+        platform = str(snapshot.get("platform") or "Shopee")
+        if platform not in PLATFORMS:
+            platform = "Shopee"
+
+        self.reset_case()
+        self.current_scan_id = str(snapshot.get("scan_id") or "") or None
+        self.current_platform = platform
+        self.platform_combo.set(platform)
+
+        modes = (
+            LAZADA_SEARCH_MODES
+            if platform == "Lazada"
+            else TIKTOK_SEARCH_MODES
+            if platform == "TikTok"
+            else SHOPEE_SEARCH_MODES
+        )
+        self.search_mode_combo.config(values=modes)
+        mode = str(snapshot.get("search_by") or "Tracking Number")
+        if mode not in modes:
+            mode = "Tracking Number"
+        self.current_search_mode = mode
+        self.search_mode_combo.set(mode)
+        self._update_search_controls()
+
+        self.order_url_entry.delete(0, tk.END)
+        self.order_url_entry.insert(0, str(snapshot.get("search_input") or ""))
+        self.current_order_id = str(snapshot.get("order_id") or "").strip() or None
+        self.return_case = copy.deepcopy(snapshot.get("return_case") or {})
+        self.returned_products = copy.deepcopy(snapshot.get("items") or [])
+        self.case_decision = copy.deepcopy(snapshot.get("case_decision"))
+        self.odoo_results = copy.deepcopy(snapshot.get("odoo_results"))
+        self.odoo_checkpoint = copy.deepcopy(snapshot.get("odoo_checkpoint"))
+        self.lark_results = copy.deepcopy(snapshot.get("lark_results") or [])
+
+        self.order_id_label.config(text=self.current_order_id or "Not loaded")
+        refund_text = str((self.return_case or {}).get("refund_text") or "Not loaded")
+        self.product_value_label.config(text=refund_text)
+        self.populate_products_table()
+        self.set_item_controls_enabled(bool(self.returned_products))
+        if self.returned_products:
+            first_iid = self.products_table.get_children()[0]
+            self.products_table.selection_set(first_iid)
+            self.products_table.focus(first_iid)
+            self.load_selected_item()
+
+        if self.odoo_checkpoint:
+            self._render_odoo_checkpoint(snapshot.get("last_error") or "")
+        elif self.odoo_results:
+            self._render_odoo_results()
+        elif state == "lark_pending":
+            self.transfer_id_label.config(text="No Odoo transfer (Not Returned)")
+            self.odoo_result_label.config(
+                text=(
+                    "RESTORED WORKFLOW\n"
+                    "Odoo was skipped because the confirmed items were Not Returned.\n"
+                    "Press Submit to retry Lark only."
+                )
+            )
+        else:
+            self.transfer_id_label.config(
+                text=str(snapshot.get("transfer_display") or "Not created yet")
+            )
+            self.odoo_result_label.config(
+                text=(
+                    "RESTORED WORKFLOW\n"
+                    f"State: {state}\n"
+                    "Review the restored item decisions, then continue."
+                )
+            )
+
+        self._sync_action_buttons()
+        if self.odoo_checkpoint and self.odoo_checkpoint.get("resume_safe", False):
+            message = (
+                f"Restored {self.current_order_id}. Validate inventory if needed, "
+                "then click Retry Odoo Return & Continue."
+            )
+        elif self.odoo_checkpoint:
+            message = (
+                f"Restored {self.current_order_id} for manual Odoo review. "
+                "Automatic return retry is disabled."
+            )
+        elif state == "lark_pending":
+            message = (
+                f"Restored {self.current_order_id}. Existing Odoo progress "
+                "is preserved; click Submit to continue with Lark."
+            )
+        else:
+            message = f"Restored {self.current_order_id}. Continue from: {state}."
+        self.set_status(message)
+
+    # =========================================================
     # ITEM TABLE / EDITING
 
     # =========================================================
@@ -1483,7 +2056,9 @@ class ReturnProcessorApp(tk.Tk):
         self.returned_products = []
         self.case_decision = None
         self.odoo_results = None
+        self.odoo_checkpoint = None
         self.lark_results = []
+        self.current_scan_id = None
         self.clear_products_table()
         self.clear_item_editor()
         self.set_item_controls_enabled(
@@ -1622,13 +2197,13 @@ class ReturnProcessorApp(tk.Tk):
         data already committed in Odoo.
 
         """
-        if self.odoo_results:
+        if self.odoo_results or self.odoo_checkpoint:
             messagebox.showwarning(
-                "Odoo Already Processed",
+                "Odoo Workflow Locked",
                 (
-                    "This order has already been processed in Odoo.\n\n"
-                    "The returned-item list cannot be changed now because "
-                    "it would no longer match the Odoo ticket/transfer."
+                    "An Odoo ticket/restore point already exists for this order.\n\n"
+                    "The returned-item list cannot be changed now because it "
+                    "would no longer match the saved Odoo workflow."
                 ),
             )
             return False
@@ -2092,6 +2667,8 @@ class ReturnProcessorApp(tk.Tk):
             "remarks": remarks,
         }
     def save_selected_item(self):
+        if not self._ensure_item_list_mutable():
+            return
         try:
             self.commit_table_edit()
             index = self.selected_item_index()
@@ -2116,6 +2693,8 @@ class ReturnProcessorApp(tk.Tk):
                 str(error),
             )
     def apply_selected_decision_to_all(self):
+        if not self._ensure_item_list_mutable():
+            return
         try:
             self.commit_table_edit()
             index = self.selected_item_index()
@@ -2244,27 +2823,49 @@ class ReturnProcessorApp(tk.Tk):
         ]
     def _sync_action_buttons(self, busy=False):
         """Single source of truth for workflow button availability."""
-        self.platform_combo.config(state="disabled" if busy else "readonly")
+        checkpoint_pending = bool(
+            self.odoo_checkpoint
+            and self.odoo_checkpoint.get("resume_safe", False)
+            and not self.lark_results
+        )
+        workflow_locked = bool(self.odoo_checkpoint)
+
+        self.platform_combo.config(
+            state="disabled" if busy or workflow_locked else "readonly"
+        )
         if busy:
             states = {
                 self.open_order_button: "disabled",
                 self.confirm_decision_button: "disabled",
                 self.submit_button: "disabled",
+                self.resume_odoo_button: "disabled",
             }
         else:
             states = {
-                self.open_order_button: "normal",
+                self.open_order_button: (
+                    "disabled" if workflow_locked else "normal"
+                ),
                 self.confirm_decision_button: (
-                    "normal" if self.returned_products else "disabled"
+                    "normal"
+                    if self.returned_products and not workflow_locked
+                    else "disabled"
                 ),
                 self.submit_button: (
                     "normal"
-                    if self.case_decision and not self.lark_results
+                    if (
+                        self.case_decision
+                        and not self.lark_results
+                        and not workflow_locked
+                    )
                     else "disabled"
+                ),
+                self.resume_odoo_button: (
+                    "normal" if checkpoint_pending else "disabled"
                 ),
             }
         for button, state in states.items():
             button.config(state=state)
+        self._refresh_restore_button(busy=busy)
     def confirm_decision(self):
         try:
             self.commit_table_edit()
@@ -2286,6 +2887,10 @@ class ReturnProcessorApp(tk.Tk):
             self.case_decision = {
                 "confirmed": True,
             }
+            self._persist_workflow(
+                "confirmed",
+                keep_restore=True,
+            )
             returned_items = self.returned_items_for_odoo()
             if not returned_items:
                 self.odoo_results = None
@@ -2330,6 +2935,7 @@ class ReturnProcessorApp(tk.Tk):
             return
         self.case_decision = None
         self.odoo_results = None
+        self.odoo_checkpoint = None
         self.lark_results = []
         self.submit_button.config(
             state="disabled",
@@ -2343,11 +2949,65 @@ class ReturnProcessorApp(tk.Tk):
         self.transfer_id_label.config(
             text="Not created yet",
         )
+        self._persist_workflow(
+            "loaded",
+            keep_restore=False,
+        )
 
     # =========================================================
     # SUBMIT WORKFLOW
 
     # =========================================================
+    def _render_odoo_checkpoint(self, error_message=""):
+        """Show the saved ticket and pending Odoo return restore point."""
+        checkpoint = self.odoo_checkpoint or {}
+        transfer_ids = []
+        for result in checkpoint.get("returns", []):
+            transfer_id = str(result.get("transfer_id", "")).strip()
+            if transfer_id and transfer_id not in transfer_ids:
+                transfer_ids.append(transfer_id)
+
+        self.transfer_id_label.config(
+            text=(
+                " | ".join(transfer_ids)
+                if transfer_ids
+                else "Return pending - ticket saved"
+            )
+        )
+
+        pending = checkpoint.get("pending_return") or {}
+        pending_items = ", ".join(
+            f"{item.get('sku', '')}_{item.get('quantity', '')}"
+            for item in pending.get("items", [])
+        )
+        lines = [
+            "ODOO RESTORE POINT SAVED",
+            f"Ticket: {checkpoint.get('ticket_title', '')}",
+            checkpoint.get("ticket_url", ""),
+        ]
+        if transfer_ids:
+            lines.append("Completed transfer(s): " + " | ".join(transfer_ids))
+        if pending:
+            lines.append(
+                f"Pending Return #{pending.get('return_index', '')}: "
+                f"{pending_items}"
+            )
+        if error_message:
+            lines.extend(["", error_message])
+        if checkpoint.get("resume_safe", False):
+            lines.extend([
+                "",
+                "Validate the related inventory transaction in Odoo, then click",
+                "Retry Odoo Return & Continue. No new Helpdesk ticket will be created.",
+            ])
+        else:
+            lines.extend([
+                "",
+                "Manual Odoo review required. Automatic retry is disabled because",
+                "the stock-return state is uncertain. No new ticket is created.",
+            ])
+        self.odoo_result_label.config(text="\n".join(lines))
+
     def _render_odoo_results(self):
         """Render completed Odoo ticket / transfer information."""
         if not self.odoo_results:
@@ -2425,7 +3085,14 @@ class ReturnProcessorApp(tk.Tk):
             platform=self.current_platform,
             progress_callback=self.set_status,
         )
+        self.odoo_checkpoint = None
         self._render_odoo_results()
+        # Persist the completed Odoo ticket/transfer before Lark starts.
+        # A restart at this point will retry Lark only, never Odoo.
+        self._persist_workflow(
+            "lark_pending",
+            keep_restore=True,
+        )
         self.set_status(
             (
                 f"Odoo completed: 1 ticket, "
@@ -2433,6 +3100,111 @@ class ReturnProcessorApp(tk.Tk):
                 "Continuing automatically to Lark..."
             )
         )
+    def resume_odoo_workflow(self):
+        """Retry the pending return on the saved ticket, then continue to Lark."""
+        if not self.odoo_checkpoint:
+            messagebox.showinfo(
+                "No Restore Point",
+                "There is no pending Odoo return to resume.",
+            )
+            return
+        if not self.odoo_checkpoint.get("resume_safe", False):
+            messagebox.showwarning(
+                "Manual Review Required",
+                "This restore point is not safe for automatic retry.",
+            )
+            return
+        if not self.browser.context:
+            messagebox.showerror(
+                "Browser Error",
+                "Playwright browser context is unavailable.",
+            )
+            return
+
+        returned_items = self.returned_items_for_odoo()
+        stage = "Odoo"
+        try:
+            self.set_processing_buttons(True)
+            self.set_status(
+                "Resuming Odoo from saved ticket; retrying pending return..."
+            )
+            self.odoo_results = resume_odoo_returns(
+                context=self.browser.context,
+                order_id=self.current_order_id,
+                returned_products=returned_items,
+                checkpoint=self.odoo_checkpoint,
+                progress_callback=self.set_status,
+            )
+            self.odoo_checkpoint = None
+            self._render_odoo_results()
+            self._persist_workflow(
+                "lark_pending",
+                keep_restore=True,
+            )
+
+            stage = "Lark"
+            self.set_status(
+                "Odoo return completed from restore point. Continuing to Lark..."
+            )
+            self._run_lark_submit_step()
+            self.set_status(
+                "Resume complete: Odoo return and Lark filing finished successfully."
+            )
+        except OdooWorkflowPausedError as error:
+            self.odoo_results = None
+            self.odoo_checkpoint = error.checkpoint
+            self._render_odoo_checkpoint(str(error))
+            self._persist_workflow(
+                "odoo_return_pending",
+                keep_restore=True,
+                last_error=str(error),
+            )
+            self.set_status(
+                "Odoo return is still pending inventory validation. Restore point kept."
+            )
+            messagebox.showwarning(
+                "Odoo Return Still Pending",
+                str(error),
+            )
+        except Exception as error:
+            if stage == "Odoo":
+                if self.odoo_checkpoint:
+                    self.odoo_checkpoint["resume_safe"] = False
+                    self._persist_workflow(
+                        "manual_review",
+                        keep_restore=True,
+                        last_error=str(error),
+                    )
+                self.set_status(
+                    "Odoo resume stopped. Manual review is required before retrying."
+                )
+                messagebox.showerror(
+                    "Odoo Resume Error",
+                    (
+                        f"{error}\n\n"
+                        "The existing Helpdesk ticket was preserved, but automatic "
+                        "retry has been disabled because the stock-return state is "
+                        "uncertain. Review Odoo before continuing."
+                    ),
+                )
+            else:
+                retry_message = (
+                    "Odoo is already complete. Press Submit again to retry "
+                    "Lark only; Odoo will not run again."
+                )
+                self._persist_workflow(
+                    "lark_pending",
+                    keep_restore=True,
+                    last_error=str(error),
+                )
+                self.set_status("Lark filing failed. " + retry_message)
+                messagebox.showerror(
+                    "Lark Error",
+                    f"{error}\n\n{retry_message}",
+                )
+        finally:
+            self.set_processing_buttons(False)
+
     def _run_lark_submit_step(self):
         """File Lark after Odoo, or directly when nothing was returned."""
         self.set_status(
@@ -2479,6 +3251,10 @@ class ReturnProcessorApp(tk.Tk):
         self.odoo_result_label.config(
             text="\n".join(lines),
         )
+        self._persist_workflow(
+            "completed",
+            keep_restore=False,
+        )
     def submit_case(self):
         """
 
@@ -2509,6 +3285,16 @@ class ReturnProcessorApp(tk.Tk):
             messagebox.showinfo(
                 "Already Submitted",
                 "This order has already been filed to Lark.",
+            )
+            return
+        if self.odoo_checkpoint:
+            messagebox.showinfo(
+                "Odoo Return Pending",
+                (
+                    "A Helpdesk ticket has already been created for this order.\n\n"
+                    "Validate the related inventory transaction, then use "
+                    "Retry Odoo Return & Continue."
+                ),
             )
             return
         if not self.browser.context:
@@ -2549,6 +3335,10 @@ class ReturnProcessorApp(tk.Tk):
                         "Filing directly to Lark..."
                     ),
                 )
+                self._persist_workflow(
+                    "lark_pending",
+                    keep_restore=True,
+                )
             # STEP 2: Lark always follows.
             stage = "Lark"
             self._run_lark_submit_step()
@@ -2566,8 +3356,29 @@ class ReturnProcessorApp(tk.Tk):
                         "finished successfully."
                     )
                 )
+        except OdooWorkflowPausedError as error:
+            self.odoo_results = None
+            self.odoo_checkpoint = error.checkpoint
+            self._render_odoo_checkpoint(str(error))
+            self._persist_workflow(
+                "odoo_return_pending",
+                keep_restore=True,
+                last_error=str(error),
+            )
+            self.set_status(
+                "Odoo ticket saved; return is waiting for inventory validation."
+            )
+            messagebox.showwarning(
+                "Odoo Return Pending",
+                str(error),
+            )
         except Exception as error:
             if stage == "Odoo":
+                self._persist_workflow(
+                    "odoo_error_manual_review",
+                    keep_restore=False,
+                    last_error=str(error),
+                )
                 self.set_status(
                     (
                         "Submit stopped: Odoo processing failed. "
@@ -2675,6 +3486,14 @@ class ReturnProcessorApp(tk.Tk):
                 fields.append(f"Remarks: {item['remarks']}")
             source = item.get("source_data")
             if isinstance(source, dict):
+                if source.get("return_item_ids"):
+                    fields.append(
+                        "Return Item IDs: " + ", ".join(source["return_item_ids"])
+                    )
+                if source.get("order_item_ids"):
+                    fields.append(
+                        "Order Item IDs: " + ", ".join(source["order_item_ids"])
+                    )
                 for name in (
                     "tracking_number", "return_order_id", "return_item_id",
                     "return_reason", "logistic_status", "product_name",
@@ -2697,6 +3516,7 @@ class ReturnProcessorApp(tk.Tk):
         )
         self.update_idletasks()
     def set_processing_buttons(self, busy):
+        self._processing_busy = bool(busy)
         self._sync_action_buttons(busy=busy)
     def on_close(self):
         try:

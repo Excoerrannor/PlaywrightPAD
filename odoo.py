@@ -18,6 +18,18 @@ ODOO_CUSTOMER_BY_PLATFORM = {
     "TikTok": "ECOMMERCE, TIKTOK",
 }
 
+
+class OdooReturnNotReadyError(RuntimeError):
+    """Safe-to-retry failure before Odoo creates the stock return."""
+
+
+class OdooWorkflowPausedError(RuntimeError):
+    """Carries a saved Helpdesk-ticket checkpoint for a later retry."""
+
+    def __init__(self, message: str, checkpoint: dict):
+        super().__init__(message)
+        self.checkpoint = checkpoint
+
 _RETURN_TABLE_JS = """
 rows => rows.map(row => {
     const productCell = row.querySelector('td[name="product_id"]');
@@ -395,10 +407,24 @@ def _open_return_transfer(
         name=order_id,
         exact=True,
     )
-    order_option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
-    order_option.click()
+    try:
+        order_option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        order_option.click()
+    except Exception as error:
+        raise OdooReturnNotReadyError(
+            f"Sales Order {order_id} is not available in the Odoo Return "
+            "dialog yet. The related inventory transaction may still need "
+            "to be validated."
+        ) from error
 
-    current = _wait_for_return_skus(dialog, desired)
+    try:
+        current = _wait_for_return_skus(dialog, desired)
+    except RuntimeError as error:
+        raise OdooReturnNotReadyError(
+            f"Sales Order {order_id} opened, but the expected returned "
+            "product(s) are not available yet. The related inventory "
+            "transaction may still need to be validated."
+        ) from error
     print("\nODOO RETURN TABLE BEFORE EDIT:")
     for sku, qty in current.items():
         print(f"{sku} | QTY {qty}")
@@ -633,6 +659,195 @@ def _build_return_groups(items: list[dict]) -> list[dict]:
     return [groups_by_key[key] for key in order]
 
 
+def _base_checkpoint(
+    *,
+    order_id: str,
+    ticket_title: str,
+    ticket_url: str,
+    first_sku: str,
+    tags: list[str],
+    platform: str,
+) -> dict:
+    platform = _text(platform) or "Shopee"
+    return {
+        "order_id": _text(order_id),
+        "ticket_title": ticket_title,
+        "ticket_url": ticket_url,
+        "product_sku": first_sku,
+        "tags": list(tags),
+        "platform": platform,
+        "customer": ODOO_CUSTOMER_BY_PLATFORM.get(
+            platform,
+            f"ECOMMERCE, {platform.upper()}",
+        ),
+        "returns": [],
+        "next_return_index": 1,
+        "resume_safe": True,
+    }
+
+
+def _process_return_groups(
+    page,
+    order_id: str,
+    returned_products: list[dict],
+    checkpoint: dict,
+    progress_callback=None,
+    force_ticket_reload: bool = False,
+) -> dict:
+    """
+    Continue stock-return creation from a saved Helpdesk ticket.
+
+    A checkpoint advances only after a return group is fully created and
+    validated. If the Sales Order / SKU is not yet available in the Return
+    dialog, Odoo has not created a stock return, so retrying that group is safe.
+    """
+    groups = _build_return_groups(returned_products)
+    return_results = list(checkpoint.get("returns") or [])
+    next_index = int(
+        checkpoint.get("next_return_index") or (len(return_results) + 1)
+    )
+
+    if next_index < 1:
+        next_index = 1
+    if next_index > len(groups) + 1:
+        raise RuntimeError("Invalid Odoo restore-point return index.")
+
+    for index in range(next_index, len(groups) + 1):
+        group = groups[index - 1]
+
+        if force_ticket_reload or index > 1:
+            _progress(
+                progress_callback,
+                f"Opening saved Helpdesk ticket for Return #{index}...",
+            )
+            page.goto(
+                checkpoint["ticket_url"],
+                wait_until="domcontentloaded",
+                timeout=SLOW_ODOO_TIMEOUT,
+            )
+            page.get_by_role(
+                "button",
+                name="Return",
+                exact=True,
+            ).wait_for(
+                state="visible",
+                timeout=SLOW_ODOO_TIMEOUT,
+            )
+
+        item_text = ", ".join(
+            f"{_text(item['sku'])}_{int(item['quantity'])}"
+            for item in group["items"]
+        )
+        _progress(
+            progress_callback,
+            f"Creating Return #{index}: {item_text} | "
+            f"{group['classification']} | {group['decision']}",
+        )
+
+        try:
+            _open_return_transfer(page, order_id, group["items"])
+        except OdooReturnNotReadyError as error:
+            checkpoint["returns"] = return_results
+            checkpoint["next_return_index"] = index
+            checkpoint["pending_return"] = {
+                "return_index": index,
+                "decision": group["decision"],
+                "classification": group["classification"],
+                "status": group["status"],
+                "items": [
+                    {
+                        "sku": _text(item["sku"]),
+                        "quantity": int(item["quantity"]),
+                    }
+                    for item in group["items"]
+                ],
+            }
+            checkpoint["resume_safe"] = True
+            raise OdooWorkflowPausedError(
+                (
+                    f"{error}\n\n"
+                    f"Odoo Helpdesk ticket already saved: "
+                    f"{checkpoint['ticket_title']}\n"
+                    "Validate the related inventory transaction, then click "
+                    "Retry Odoo Return & Continue. The existing Helpdesk "
+                    "ticket will be reused."
+                ),
+                checkpoint,
+            ) from error
+
+        if group["classification"] == "New":
+            stock_result = _process_brand_new(page)
+        else:
+            stock_result = _process_open_box_or_defective(
+                page,
+                group["items"],
+            )
+
+        return_results.append({
+            "return_index": index,
+            "decision": group["decision"],
+            "classification": group["classification"],
+            "status": group["status"],
+            "items": [
+                {
+                    "sku": _text(item["sku"]),
+                    "quantity": int(item["quantity"]),
+                }
+                for item in group["items"]
+            ],
+            **stock_result,
+        })
+        checkpoint["returns"] = return_results
+        checkpoint["next_return_index"] = index + 1
+        checkpoint.pop("pending_return", None)
+
+        _progress(
+            progress_callback,
+            f"Return #{index} completed: {stock_result['transfer_id']}",
+        )
+
+    checkpoint["returns"] = return_results
+    checkpoint["next_return_index"] = None
+    checkpoint["resume_safe"] = False
+    checkpoint.pop("pending_return", None)
+    return checkpoint
+
+
+def resume_odoo_returns(
+    context,
+    order_id: str,
+    returned_products: list[dict],
+    checkpoint: dict,
+    progress_callback=None,
+) -> dict:
+    """Resume only the pending Odoo stock return(s) on an existing ticket."""
+    if not checkpoint:
+        raise ValueError("No Odoo restore point is available.")
+    if not checkpoint.get("resume_safe", False):
+        raise RuntimeError(
+            "This Odoo restore point is not marked safe to retry automatically."
+        )
+    if _text(checkpoint.get("order_id")) != _text(order_id):
+        raise RuntimeError(
+            "Odoo restore point does not belong to the currently loaded order."
+        )
+
+    page = get_or_open_odoo_page(context)
+    page.bring_to_front()
+    _progress(
+        progress_callback,
+        "Resuming Odoo from saved Helpdesk ticket; no new ticket will be created...",
+    )
+    return _process_return_groups(
+        page=page,
+        order_id=_text(order_id),
+        returned_products=returned_products,
+        checkpoint=checkpoint,
+        progress_callback=progress_callback,
+        force_ticket_reload=True,
+    )
+
+
 def create_odoo_tickets(
     context,
     order_id: str,
@@ -644,6 +859,10 @@ def create_odoo_tickets(
     """
     Create one Helpdesk ticket for a marketplace order and one or more stock
     returns grouped by Decision + Classification + Status.
+
+    If the source Sales Order is not yet available for Return, raise a
+    checkpoint-bearing OdooWorkflowPausedError. The caller can later invoke
+    resume_odoo_returns() without creating a duplicate Helpdesk ticket.
     """
     order_id = _text(order_id)
     if not order_id:
@@ -710,85 +929,29 @@ def create_odoo_tickets(
     _progress(progress_callback, "Setting priority to Urgent...")
     _set_urgent_priority(page)
 
-    groups = _build_return_groups(returned_products)
-    return_results = []
+    checkpoint = _base_checkpoint(
+        order_id=order_id,
+        ticket_title=ticket_title,
+        ticket_url=ticket_url,
+        first_sku=first_sku,
+        tags=tags,
+        platform=platform,
+    )
 
-    for index, group in enumerate(groups, start=1):
-        if index > 1:
-            _progress(
-                progress_callback,
-                f"Returning to Helpdesk ticket for Return #{index}...",
-            )
-            page.goto(
-                ticket_url,
-                wait_until="domcontentloaded",
-                timeout=SLOW_ODOO_TIMEOUT,
-            )
-            page.get_by_role(
-                "button",
-                name="Return",
-                exact=True,
-            ).wait_for(
-                state="visible",
-                timeout=SLOW_ODOO_TIMEOUT,
-            )
-
-        item_text = ", ".join(
-            f"{_text(item['sku'])}_{int(item['quantity'])}"
-            for item in group["items"]
-        )
-        _progress(
-            progress_callback,
-            f"Creating Return #{index}: {item_text} | "
-            f"{group['classification']} | {group['decision']}",
-        )
-
-        _open_return_transfer(page, order_id, group["items"])
-
-        if group["classification"] == "New":
-            stock_result = _process_brand_new(page)
-        else:
-            stock_result = _process_open_box_or_defective(
-                page,
-                group["items"],
-            )
-
-        return_results.append({
-            "return_index": index,
-            "decision": group["decision"],
-            "classification": group["classification"],
-            "status": group["status"],
-            "items": [
-                {
-                    "sku": _text(item["sku"]),
-                    "quantity": int(item["quantity"]),
-                }
-                for item in group["items"]
-            ],
-            **stock_result,
-        })
-
-        _progress(
-            progress_callback,
-            f"Return #{index} completed: {stock_result['transfer_id']}",
-        )
-
-    return {
-        "ticket_title": ticket_title,
-        "ticket_url": ticket_url,
-        "product_sku": first_sku,
-        "tags": tags,
-        "platform": _text(platform) or "Shopee",
-        "customer": ODOO_CUSTOMER_BY_PLATFORM.get(
-            _text(platform) or "Shopee",
-            f"ECOMMERCE, {(_text(platform) or 'Shopee').upper()}",
-        ),
-        "returns": return_results,
-    }
+    return _process_return_groups(
+        page=page,
+        order_id=order_id,
+        returned_products=returned_products,
+        checkpoint=checkpoint,
+        progress_callback=progress_callback,
+        force_ticket_reload=False,
+    )
 
 
 __all__ = [
     "build_ticket_title",
     "get_or_open_odoo_page",
     "create_odoo_tickets",
+    "resume_odoo_returns",
+    "OdooWorkflowPausedError",
 ]

@@ -1,4 +1,6 @@
+import copy
 import re
+from decimal import Decimal
 
 DEFAULT_TIMEOUT = 30_000
 SEARCH_READY_TIMEOUT = 12_000
@@ -262,6 +264,101 @@ def _extract_card_data(card) -> dict:
     )
 
 
+def _group_return_items_by_sku(items: list[dict]) -> list[dict]:
+    """Show one Lazada row per Seller SKU without losing return-item identity.
+
+    Lazada's return list renders each Return Item ID as a separate line and
+    normally does not expose a per-line QTY. Grouping therefore sums each
+    source line's assumed quantity and REFUND AMOUNT; it must NOT multiply an
+    already-summed refund by the resulting grouped quantity.
+
+    The original lines (including every Return Item ID and Order Item ID) are
+    kept in ``source_rows`` for JSON history/recovery and manual audit.
+    """
+    by_sku = {}
+    seen_return_ids = set()
+    for original in items:
+        row = copy.deepcopy(original)
+        sku = _text(row.get("sku")).upper()
+        if not sku:
+            raise ValueError("A Lazada return item has no Seller SKU ID.")
+        row["sku"] = sku
+        try:
+            qty = int(row.get("quantity") or 1)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid Lazada return quantity for {sku}.") from error
+        if qty <= 0:
+            raise ValueError(f"Invalid Lazada return quantity for {sku}: {qty}.")
+        row["quantity"] = qty
+
+        return_id = _text(row.get("return_item_id"))
+        if return_id:
+            if return_id in seen_return_ids:
+                raise ValueError(
+                    "Lazada returned the same Return Item ID more than once: "
+                    f"{return_id}. Refusing to double-count the unit."
+                )
+            seen_return_ids.add(return_id)
+        by_sku.setdefault(sku, []).append(row)
+
+    def unique_values(rows, name):
+        return list(dict.fromkeys(
+            _text(row.get(name)) for row in rows if _text(row.get(name))
+        ))
+
+    def common_value(rows, name):
+        values = {_text(row.get(name)) for row in rows}
+        return values.pop() if len(values) == 1 else ""
+
+    def total_money(rows, name):
+        return float(sum(
+            (Decimal(str(row.get(name) or 0)) for row in rows), Decimal("0")
+        ).quantize(Decimal("0.01")))
+
+    grouped = []
+    for sku, rows in by_sku.items():
+        combined = copy.deepcopy(rows[0])
+        combined["quantity"] = sum(row["quantity"] for row in rows)
+        combined["source_item_count"] = len(rows)
+        combined["source_rows"] = rows
+        combined["quantity_assumed"] = any(
+            bool(row.get("quantity_assumed")) for row in rows
+        )
+
+        # Distinct source IDs are retained; a multiple-ID group does not
+        # misleadingly claim to have one single Return Item ID.
+        combined["return_item_ids"] = unique_values(rows, "return_item_id")
+        combined["order_item_ids"] = unique_values(rows, "order_item_id")
+        combined["return_item_id"] = (
+            combined["return_item_ids"][0] if len(rows) == 1
+            and combined["return_item_ids"] else ""
+        )
+        combined["order_item_id"] = (
+            combined["order_item_ids"][0] if len(rows) == 1
+            and combined["order_item_ids"] else ""
+        )
+
+        # Monetary values are TOTALS for the grouped row, not unit prices.
+        combined["refund_amount"] = total_money(rows, "refund_amount")
+        combined["refund_text"] = f"₱{combined['refund_amount']:,.2f}"
+        combined["my_payment"] = total_money(rows, "my_payment")
+        combined["my_payment_text"] = f"₱{combined['my_payment']:,.2f}"
+
+        # Never auto-mark the group Returned if even one underlying item is
+        # still in progress. The operator must confirm mixed source statuses.
+        combined["mixed_delivery_status"] = len({
+            suggested_processor_status(row) for row in rows
+        }) > 1
+        for name in (
+            "source_status", "logistic_status", "tracking_number",
+            "return_reason", "return_type", "product_name", "sla",
+        ):
+            combined[name] = common_value(rows, name)
+        grouped.append(combined)
+
+    return grouped
+
+
 def _find_result_card(page, query: str, search_by: str):
     if search_by == "Order ID":
         anchor = page.locator(
@@ -357,10 +454,16 @@ def get_lazada_return_order(
             f"No Lazada return items were found for {search_by} {query}."
         )
 
+    # Filter by waybill BEFORE grouping; do not accidentally combine another
+    # parcel under the same Order ID into the scanned parcel's return.
+    grouped_items = _group_return_items_by_sku(items)
     total_refund = round(
-        sum(float(item.get("refund_amount") or 0) for item in items),
+        sum(float(item.get("refund_amount") or 0) for item in grouped_items),
         2,
     )
+    data["source_item_count"] = len(items)
+    data["sku_group_count"] = len(grouped_items)
+    data["items"] = grouped_items
 
     data["refund_value"] = total_refund
     data["refund_text"] = f"₱{total_refund:,.2f}"
@@ -384,6 +487,13 @@ def get_lazada_return_by_tracking(page, tracking_number: str) -> dict:
 
 def suggested_processor_status(item: dict) -> str:
     """Auto-mark Returned only when Lazada clearly says it reached the seller."""
+    source_rows = item.get("source_rows") or []
+    if source_rows:
+        return (
+            "Returned"
+            if all(suggested_processor_status(row) == "Returned" for row in source_rows)
+            else ""
+        )
     source_status = _text(item.get("source_status")).lower()
     logistic_status = _text(item.get("logistic_status")).lower()
 

@@ -433,12 +433,18 @@ def get_tiktok_return_order(
         )
 
     count_match = re.search(r"(\d+)", _text(data.get("item_count_text")))
-    if count_match and int(count_match.group(1)) != len(products):
-        raise ValueError(
-            "TikTok product popover count did not match the return row. "
-            f"Row shows {count_match.group(1)} item(s), popover exposed "
-            f"{len(products)}. Retry the scan before submitting."
+    if count_match:
+        expected_item_count = int(count_match.group(1))
+        actual_total_qty = sum(
+            max(int(product.get("quantity") or 1), 1)
+            for product in products
         )
+        if expected_item_count != actual_total_qty:
+            raise ValueError(
+                "TikTok product quantity did not match the return row. "
+                f"Row shows {expected_item_count} item(s), popover quantity "
+                f"totals {actual_total_qty}. Retry the scan before submitting."
+            )
 
     data["items"] = products
     data["platform"] = "TikTok"
