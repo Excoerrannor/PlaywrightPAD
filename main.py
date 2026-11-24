@@ -1,6 +1,7 @@
 import copy
+import re
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 from browser_manager import BrowserManager
 from shopee import (
     get_order_id,
@@ -14,11 +15,24 @@ from tiktok import get_tiktok_return_order
 from odoo import (
     create_odoo_tickets,
     resume_odoo_returns,
+    recover_existing_odoo_draft,
+    confirm_existing_transfers_for_lark,
     OdooWorkflowPausedError,
 )
-from lark import file_lark_returns
-from workflow_store import WorkflowStore
-from history_window import HistoryRecoveryWindow
+from lark import (
+    file_lark_returns, verify_tiktok_source_coverage,
+    preview_tiktok_manual_selection, confirm_tiktok_manual_selection,
+)
+from wrong_item_lark import (
+    WRONG_ITEM_CLASSIFICATIONS, WRONG_ITEM_STATUSES,
+    is_wrong_item, default_wrong_item_status, plan_wrong_item_filings,
+    submit_wrong_item_plan,
+)
+from workflow_store import (
+    WorkflowStore, NEW_STOCK_DESTINATIONS, DEFAULT_NEW_STOCK_DESTINATION,
+    normalize_new_stock_destination,
+)
+from history_window import HistoryRecoveryWindow, DuplicateTicketResolutionDialog
 from ui_theme import (
     apply_theme, RoundedCard, RoundedButton, configure_readonly_text, configure_transfer_entry,
     INK, DEEP_TEAL, MUTED, TEAL_TINT, AMBER, TEAL,
@@ -37,6 +51,7 @@ CLASSIFICATIONS = [
     "Unsealed",
     "Defective",
     "Wrong Item",
+    "Scam",
     "Missing Item",
 ]
 DECISIONS = [
@@ -263,8 +278,12 @@ class ReturnProcessorApp(tk.Tk):
         # source inventory transaction is not ready for Odoo Return yet.
         self.odoo_checkpoint = None
         self.lark_results = []
+        self.normal_lark_results = []
+        self.wrong_item_lark_results = []
         # Persistent JSON audit/recovery state.
         self.workflow_store = WorkflowStore()
+        self.app_settings = self.workflow_store.load_settings()
+        self.new_stock_destination = self.app_settings['new_stock_destination']
         self.current_scan_id = None
         self._processing_busy = False
         self._history_window = None
@@ -309,7 +328,17 @@ class ReturnProcessorApp(tk.Tk):
             toolbar, text="Recovery", surface="dark", command=self.open_recovery_window,
             state="disabled",
         )
-        self.recovery_toolbar_button.pack(side="left")
+        self.recovery_toolbar_button.pack(side="left", padx=(0, 8))
+        self.save_scan_button = RoundedButton(
+            toolbar, text="Save for Recovery", surface="dark",
+            command=self.save_scan_for_recovery, state="disabled",
+        )
+        self.save_scan_button.pack(side="left", padx=(0, 8))
+        self.settings_button = RoundedButton(
+            toolbar, text="Settings", surface="dark",
+            command=self.open_settings,
+        )
+        self.settings_button.pack(side="left")
         self.toolbar_hint = ttk.Label(
             toolbar, text="Saved scans  /  Safe restore points", style="ToolbarHint.TLabel",
         )
@@ -452,6 +481,25 @@ class ReturnProcessorApp(tk.Tk):
         self.open_order_button.grid(
             row=1, column=4, padx=(10, 0), pady=(5, 0)
         )
+        # Per-order override. Settings controls the default for future scans.
+        ttk.Label(source_frame, text="Brand New destination:").grid(
+            row=2, column=0, sticky="w", pady=(7, 0)
+        )
+        self.new_stock_destination_combo = ttk.Combobox(
+            source_frame, values=NEW_STOCK_DESTINATIONS,
+            state="disabled", width=15,
+        )
+        self.new_stock_destination_combo.set(self.new_stock_destination)
+        self.new_stock_destination_combo.grid(
+            row=2, column=1, sticky="w", pady=(7, 0)
+        )
+        self.new_stock_destination_combo.bind(
+            "<<ComboboxSelected>>", self.on_new_stock_destination_changed
+        )
+        ttk.Label(
+            source_frame,
+            text="Applies only to New items; saved with this scan",
+        ).grid(row=2, column=2, columnspan=3, sticky="w", padx=(8, 0), pady=(7, 0))
         self.workspace_separator = ttk.Separator(main_frame, orient="horizontal")
         self.workspace_separator.grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(6, 9),
@@ -876,6 +924,22 @@ class ReturnProcessorApp(tk.Tk):
             sticky="ew",
             pady=4,
         )
+        self.wrong_item_status_label = ttk.Label(
+            self.item_frame, text="Wrong Item / Scam Status:"
+        )
+        self.wrong_item_status_combo = ttk.Combobox(
+            self.item_frame, values=WRONG_ITEM_STATUSES, state="disabled"
+        )
+        self.received_item_label = ttk.Label(
+            self.item_frame, text="Received Item:"
+        )
+        self.received_item_text = tk.Text(
+            self.item_frame, height=2, wrap="word", state="disabled",
+            bg="#FFFFFF", fg=INK, insertbackground=INK,
+            selectbackground="#B6EDF0", selectforeground=INK,
+            relief="flat", highlightthickness=1,
+            highlightbackground="#B9D2D5",
+        )
         item_actions = ttk.Frame(self.item_frame, style="Card.TFrame")
         self.item_actions = item_actions
         item_actions.grid(
@@ -929,10 +993,15 @@ class ReturnProcessorApp(tk.Tk):
         self.resume_odoo_button.pack(
             side="left", padx=(8, 0),
         )
+        self.manual_lark_button = RoundedButton(
+            item_actions, kind="teal", text="Confirm Existing TC/IN & File Lark",
+            command=self.file_lark_from_verified_transfer, state="disabled",
+        )
+        self.manual_lark_button.pack(side="left", padx=(8, 0))
         self._decision_actions = [
             self.save_item_button, self.apply_all_button,
             self.confirm_decision_button, self.submit_button,
-            self.resume_odoo_button,
+            self.resume_odoo_button, self.manual_lark_button,
         ]
         # -----------------------------------------------------
         # Status / Results
@@ -1078,6 +1147,40 @@ class ReturnProcessorApp(tk.Tk):
                                               sticky="nsew", pady=(0, 7))
         self.copy_all_button.grid_configure(row=8, column=1, sticky="e", pady=(0, 1))
 
+    def _layout_wrong_item_controls(self):
+        """Show the extra fields only for Wrong Item / Scam classifications."""
+        if not hasattr(self, "wrong_item_status_combo") or not hasattr(self, "item_actions"):
+            return
+        special = self.classification_combo.get().strip() in WRONG_ITEM_CLASSIFICATIONS
+        compact = self._responsive_mode == "compact"
+        # The six existing fields occupy 0-2 compact, remarks row 3.
+        base_row = 4 if compact else 3
+        span = 4 if compact else 6
+        if special:
+            self.wrong_item_status_label.grid(row=base_row, column=0,
+                                              sticky="w", pady=3)
+            self.wrong_item_status_combo.grid(row=base_row, column=1,
+                                              columnspan=(3 if compact else 5),
+                                              sticky="ew", pady=3)
+            self.received_item_label.grid(row=base_row+1, column=0,
+                                           sticky="nw", pady=3)
+            self.received_item_text.grid(row=base_row+1, column=1,
+                                         columnspan=(3 if compact else 5),
+                                         sticky="ew", pady=3)
+        else:
+            for widget in (self.wrong_item_status_label, self.wrong_item_status_combo,
+                           self.received_item_label, self.received_item_text):
+                widget.grid_remove()
+        self.item_actions.grid_configure(row=base_row + (2 if special else 0),
+                                         column=0, columnspan=span, sticky="ew")
+        enabled = self.returned_products and str(self.classification_combo.cget("state")) != "disabled"
+        self.wrong_item_status_combo.config(
+            state="readonly" if special and enabled else "disabled"
+        )
+        self.received_item_text.config(
+            state="normal" if special and enabled else "disabled"
+        )
+
     def _schedule_responsive_layout(self, event):
         """Coalesce high-frequency Windows resize events; only reposition widgets."""
         if event.widget is not self:
@@ -1113,6 +1216,7 @@ class ReturnProcessorApp(tk.Tk):
         self.remarks_label.grid_configure(row=next_row, column=0, sticky="nw")
         self.remarks_text.grid_configure(row=next_row, column=1, columnspan=3, sticky="ew")
         self.item_actions.grid_configure(row=next_row+1, column=0, columnspan=4, sticky="ew")
+        self._layout_wrong_item_controls()
         # Responsive actions: two equal-width columns and a full-width
         # Retry button. In compact mode the critical confirmation and submit
         # actions receive their own rows so labels never get clipped.
@@ -1123,15 +1227,18 @@ class ReturnProcessorApp(tk.Tk):
             action.grid_forget()
         if mode == "wide":
             positions = (
-                (0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1), (2, 0, 2),
+                (0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1),
+                (2, 0, 2), (3, 0, 2),
             )
         else:
             positions = (
-                (0, 0, 1), (0, 1, 1), (1, 0, 2), (2, 0, 2), (3, 0, 2),
+                (0, 0, 1), (0, 1, 1), (1, 0, 2), (2, 0, 2),
+                (3, 0, 2), (4, 0, 2),
             )
         for button, (row, column, span) in zip(self._decision_actions, positions):
             button.grid(row=row, column=column, columnspan=span,
                         sticky="ew", padx=(4, 4), pady=(0 if row == 0 else 7, 0))
+        self._layout_wrong_item_controls()
         if mode == "wide":
             self.hero_hint.grid()
             if not self.toolbar_hint.winfo_manager():
@@ -1451,6 +1558,8 @@ class ReturnProcessorApp(tk.Tk):
             "platform": platform,
             "grade": "",
             "remarks": "",
+            "received_item": "",
+            "wrong_item_status": "",
         }
         if source_data:
             record["source_data"] = copy.deepcopy(source_data)
@@ -1631,7 +1740,13 @@ class ReturnProcessorApp(tk.Tk):
             )
 
     def process_tiktok_return_data(self, data: dict):
-        """Normalize one TikTok Manage returns result into the shared workflow."""
+        """Load every independently verified TikTok return under one Order ID.
+
+        One TikTok marketplace order may appear as multiple return cards, each
+        with its own Return Order ID/refund and one or more Seller SKUs. Keep
+        the per-card identity on every item, rather than incorrectly treating
+        additional cards as unrelated order duplicates.
+        """
         self.reset_case()
         self.current_platform = "TikTok"
 
@@ -1639,12 +1754,26 @@ class ReturnProcessorApp(tk.Tk):
         if not order_id:
             raise ValueError("TikTok return data has no Order ID.")
 
+        returns = list(data.get("returns") or [])
+        multi_return = len(returns) > 1
+        return_ids = [
+            str(value).strip()
+            for value in (
+                data.get("return_order_ids")
+                or [data.get("return_order_id")]
+            )
+            if str(value or "").strip()
+        ]
+        if multi_return and len(set(return_ids)) != len(returns):
+            raise ValueError("TikTok return cards have missing or duplicate Return Order IDs.")
+
         refund_value = float(data.get("refund_value") or 0)
         refund_text = data.get("refund_text") or f"₱{refund_value:,.2f}"
         self.current_order_id = order_id
         self.return_case = {
             "order_id": order_id,
-            "request_id": str(data.get("return_order_id") or "").strip(),
+            "request_id": ", ".join(return_ids),
+            "return_order_ids": return_ids,
             "refund_text": refund_text,
             "refund_value": refund_value,
             "return_url": data.get("return_url") or "",
@@ -1652,9 +1781,19 @@ class ReturnProcessorApp(tk.Tk):
             "search_by": str(data.get("search_by") or "Tracking Number").strip(),
             "search_query": str(data.get("search_query") or "").strip(),
             "platform": "TikTok",
-            # TikTok's overview exposes one refund total for the return, not
-            # a dependable per-SKU refund allocation. Keep Shopee-style total
-            # value behavior for Lark instead of inventing item amounts.
+            # Multiple return cards have separate refund totals. Lark can use
+            # an entire return's total when all its items remain together;
+            # splitting a multi-SKU card across transfers requires manual
+            # item amounts, not an invented proportional allocation.
+            "value_mode": "tiktok_return_groups" if multi_return else "return_total",
+            "return_group_totals": {
+                str(row.get("return_order_id")): float(row["refund_value"])
+                for row in returns
+            } if multi_return else {},
+            "return_group_quantities": {
+                str(row.get("return_order_id")): int(row["source_item_count"])
+                for row in returns
+            } if multi_return else {},
             "value_source": data.get("value_source") or "TikTok return Refund total",
         }
 
@@ -1665,69 +1804,354 @@ class ReturnProcessorApp(tk.Tk):
         if not raw_items:
             raise ValueError("No TikTok return items were found for this return.")
 
+        # Source groups may be complete while extracted SKU rows are partial
+        # (for example a product-detail popover failed to open). Detect that
+        # BEFORE confirming items or creating any Odoo Helpdesk ticket.
+        verify_tiktok_source_coverage(
+            self.return_case,
+            [{"source_data": {"return_order_id": raw.get("return_order_id")},
+              "sku": raw.get("sku"), "quantity": raw.get("quantity")}
+             for raw in raw_items],
+        )
         single_item = len(raw_items) == 1
         items = []
+        unknown_amount_groups = set()
         for raw in raw_items:
             source_data = dict(raw)
+            # Per-card fields are the source of truth when the order has
+            # multiple independent return requests.
+            return_id = str(raw.get("return_order_id") or data.get("return_order_id") or "")
             source_data.update({
-                "return_order_id": data.get("return_order_id") or "",
-                "return_reason": data.get("return_reason") or "",
-                "source_status": data.get("source_status") or "",
-                "logistics_status": data.get("logistics_status") or "",
-                "logistics_time": data.get("logistics_time") or "",
-                "paid_text": data.get("paid_text") or "",
-                "refund_text": refund_text,
+                "return_order_id": return_id,
+                "return_reason": raw.get("return_reason") or data.get("return_reason") or "",
+                "source_status": raw.get("source_status") or data.get("source_status") or "",
+                "logistics_status": raw.get("logistics_status") or data.get("logistics_status") or "",
+                "logistics_time": raw.get("logistics_time") or data.get("logistics_time") or "",
+                "paid_text": raw.get("paid_text") or data.get("paid_text") or "",
+                "refund_text": raw.get("return_group_refund_text") or refund_text,
             })
+            single_sku_in_card = int(raw.get("return_group_item_rows") or 0) == 1
+            # It is safe to associate an entire return refund with its only
+            # product row; for a multi-SKU return, per-SKU amounts are unknown.
+            if multi_return:
+                amount = (
+                    float(raw.get("return_group_refund_value") or 0)
+                    if single_sku_in_card else ""
+                )
+                if not single_sku_in_card:
+                    unknown_amount_groups.add(return_id)
+            else:
+                amount = refund_value if single_item else ""
+
             items.append(
                 self._new_item_record(
                     sku=raw.get("sku", ""),
                     quantity=int(raw.get("quantity") or 1),
                     unit_price="",
-                    amount=(refund_value if single_item else ""),
+                    amount=amount,
                     platform="TikTok",
-                    # A scanned return waybill represents a parcel physically
-                    # being processed by the team. TikTok's logistics status can
-                    # lag behind the physical handoff, so keep the existing
-                    # receiving workflow default of Returned.
                     status=RETURNED_STATUS,
                     source_data=source_data,
                 )
             )
 
+        total_units = sum(int(item["quantity"]) for item in items)
         notes = []
-        if not single_item:
+        if multi_return:
+            notes.append(
+                f"{len(returns)} separate TikTok Return Order IDs were combined "
+                "under one marketplace order. Each item retains its source return ID."
+            )
+            if unknown_amount_groups:
+                notes.append(
+                    "Multi-SKU return cards have no verified per-SKU refund "
+                    "allocation. Amount is optional at scan time; if those "
+                    "items are split across different Odoo/Lark filings, "
+                    "enter their correct amounts manually before filing."
+                )
+        elif not single_item:
             notes.append(
                 "TikTok provides a return-level refund total but no reliable "
-                "per-item refund allocation in this view, so item Amounts are "
-                "left blank and are optional for TikTok. Lark uses the TikTok "
-                "return refund total."
+                "per-item refund allocation in this view. Item Amounts are "
+                "optional for TikTok."
             )
         logistics = str(data.get("logistics_status") or "").strip()
-        if logistics:
+        if logistics and not multi_return:
             notes.append(f"TikTok source logistics: {logistics}.")
 
         self._show_loaded_items(
             items,
             (
-                f"TikTok return loaded: {order_id} | {len(items)} item(s) | "
-                f"Return Order ID {data.get('return_order_id') or 'N/A'} | "
-                f"Searched by {data.get('search_by') or 'Tracking Number'}. "
+                f"TikTok return loaded: {order_id} | {len(returns) or 1} "
+                f"return request(s) | {len(items)} SKU row(s) / {total_units} "
+                f"unit(s) | Refund {refund_text} | "
+                f"Search: {data.get('search_by') or 'Tracking Number'}. "
                 + " ".join(notes)
             ),
         )
 
         print("\nTIKTOK RETURN SOURCE DETAILS:")
-        print(
-            f"Order {order_id} | Return {data.get('return_order_id', '')} | "
-            f"Refund {refund_text} | Reason {data.get('return_reason', '')} | "
-            f"Logistics {data.get('logistics_status', '')}"
-        )
+        for row in returns or [data]:
+            print(
+                f"Return {row.get('return_order_id', '')} | "
+                f"Items {row.get('source_item_count', '')} | "
+                f"Refund {row.get('refund_text', '')} | "
+                f"Reason {row.get('return_reason', '')}"
+            )
         for item in items:
             src = item.get("source_data", {})
             print(
+                f"Return {src.get('return_order_id', '')}: "
                 f"{item['sku']} | QTY {item['quantity']} | "
                 f"{src.get('product_name', '')}"
             )
+
+    # =========================================================
+    # SETTINGS / MANUAL SAVE
+    # =========================================================
+    def open_settings(self):
+        """Edit persistent defaults without touching existing Odoo checkpoints."""
+        if self._processing_busy:
+            messagebox.showwarning("Processor Busy", "Finish the active operation first.")
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Makerlab | Processor Settings")
+        window.geometry("540x290")
+        window.minsize(490, 265)
+        window.transient(self)
+        window.grab_set()
+        apply_theme(window)
+
+        frame = RoundedCard(window, title="APPLICATION SETTINGS")
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        content = frame.content
+        content.columnconfigure(1, weight=1)
+
+        ttk.Label(content, text="Default destination for New items:").grid(
+            row=0, column=0, sticky="w", padx=(0, 14), pady=(6, 8)
+        )
+        value = tk.StringVar(value=self.app_settings['new_stock_destination'])
+        combo = ttk.Combobox(
+            content, textvariable=value, state="readonly",
+            values=NEW_STOCK_DESTINATIONS, width=16,
+        )
+        combo.grid(row=0, column=1, sticky="ew", pady=(6, 8))
+        help_text = (
+            "This default applies to future scans. The destination for a "
+            "loaded order can also be changed in the main window. "
+            "Odoo checkpoints keep their original selection."
+        )
+        ttk.Label(content, text=help_text, wraplength=465).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(3, 14)
+        )
+        can_apply = not (self.odoo_checkpoint or self.odoo_results or self.lark_results
+                         or self.normal_lark_results or self.wrong_item_lark_results)
+        apply_current = tk.BooleanVar(value=can_apply)
+        check = ttk.Checkbutton(
+            content,
+            text="Also apply to the currently loaded scan (if available)",
+            variable=apply_current,
+        )
+        check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        if not can_apply:
+            check.configure(state="disabled")
+            apply_current.set(False)
+
+        actions = ttk.Frame(content, style="Card.TFrame")
+        actions.grid(row=3, column=0, columnspan=2, sticky="e")
+
+        def save_settings():
+            chosen = value.get().strip()
+            try:
+                saved = self.workflow_store.save_settings(
+                    new_stock_destination=chosen,
+                )
+                self.app_settings = saved
+                if apply_current.get() and can_apply:
+                    self._apply_new_stock_destination(chosen)
+                elif not self.current_order_id:
+                    self.new_stock_destination = chosen
+                    self.new_stock_destination_combo.set(chosen)
+                window.destroy()
+                self.set_status(
+                    "Settings saved: default Brand New destination is " + chosen
+                )
+            except Exception as error:
+                messagebox.showerror("Settings Save Error", str(error), parent=window)
+
+        RoundedButton(
+            actions, text="Save Settings", command=save_settings,
+        ).pack(side="left", padx=(0, 8))
+        RoundedButton(
+            actions, text="Cancel", command=window.destroy,
+        ).pack(side="left")
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+
+    def _apply_new_stock_destination(self, chosen):
+        chosen = normalize_new_stock_destination(chosen, default="")
+        if (self.odoo_checkpoint or self.odoo_results or self.lark_results or
+                self.normal_lark_results or self.wrong_item_lark_results):
+            raise RuntimeError(
+                "This order already has Odoo/Lark progress. Its saved warehouse "
+                "destination is locked to protect the existing transfer."
+            )
+        self.new_stock_destination = chosen
+        self.new_stock_destination_combo.set(chosen)
+        if self.current_order_id and self.current_scan_id:
+            # Keep an existing manual save or confirmed checkpoint consistent.
+            existing_restore = self.workflow_store.get_restore_point(self.current_scan_id)
+            if existing_restore:
+                state = "confirmed" if self.case_decision else "manually_saved"
+                snapshot = self._workflow_snapshot(state)
+                self.workflow_store.save_restore_point(self.current_scan_id, snapshot)
+                self.workflow_store.update_scan(
+                    self.current_scan_id,
+                    workflow_state=state,
+                    new_stock_destination=chosen,
+                )
+            else:
+                self.workflow_store.update_scan(
+                    self.current_scan_id,
+                    new_stock_destination=chosen,
+                )
+            self._refresh_restore_button()
+
+    def on_new_stock_destination_changed(self, _event=None):
+        chosen = self.new_stock_destination_combo.get().strip()
+        try:
+            self._apply_new_stock_destination(chosen)
+            self.set_status(
+                "Brand New destination for this scan: " + chosen
+            )
+        except Exception as error:
+            self.new_stock_destination_combo.set(self.new_stock_destination)
+            messagebox.showwarning("Destination Not Changed", str(error))
+
+    def _capture_selected_item_draft(self):
+        """Save partial editor values without requiring final classifications."""
+        index = self.selected_item_index()
+        if index is None or not self.returned_products:
+            return
+        if self.odoo_checkpoint or self.odoo_results:
+            # Existing Odoo work must be treated as immutable.
+            return
+        item = self.returned_products[index]
+        raw_amount = self.amount_entry.get().strip()
+        if raw_amount:
+            try:
+                amount = float(raw_amount)
+            except ValueError as error:
+                raise ValueError("The selected item Amount must be numeric.") from error
+            if not (0 <= amount < float('inf')):
+                raise ValueError("The selected item Amount must be nonnegative and finite.")
+            amount = round(amount, 2)
+        else:
+            amount = ""  # Optional on TikTok; final confirmation validates it.
+        new_values = {
+            "amount": amount,
+            "classification": self.classification_combo.get().strip(),
+            "odoo_tag": self.odoo_tag_combo.get().strip(),
+            "decision": self.decision_combo.get().strip(),
+            "status": self.return_status_combo.get().strip(),
+            "grade": self.grade_combo.get().strip(),
+            "remarks": self.remarks_text.get("1.0", tk.END).strip(),
+            "received_item": self.received_item_text.get("1.0", tk.END).strip(),
+            "wrong_item_status": self.wrong_item_status_combo.get().strip(),
+        }
+        changed = any(item.get(key) != value for key, value in new_values.items())
+        if changed:
+            item.update(new_values)
+            self.refresh_product_row(index)
+            if self.case_decision:
+                # A confirmed case must be reviewed/confirmed again after edits.
+                self.case_decision = None
+                self.odoo_result_label.config(
+                    text="Item draft changed. Confirm All Items before Submit."
+                )
+                self._sync_action_buttons()
+
+    def save_scan_for_recovery(self):
+        """Durably save the current scan, even before items are confirmed.
+
+        NEVER creates an Odoo ticket or stock transfer; the existing scan_id is
+        reused so the history entry is updated rather than duplicated.
+        """
+        if self._processing_busy or not self.current_order_id or not self.returned_products:
+            messagebox.showwarning(
+                "Cannot Save Scan", "Load a return before saving it for recovery."
+            )
+            return
+        if self.lark_results or self.normal_lark_results or self.wrong_item_lark_results:
+            messagebox.showinfo("Lark Progress Saved",
+                                "Existing Lark filing progress is already saved. "
+                                "Use Recovery; do not overwrite the checkpoint with an unconfirmed scan.")
+            return
+        if self.odoo_checkpoint or self.odoo_results:
+            messagebox.showinfo(
+                "Odoo Checkpoint Already Saved",
+                "Odoo/Lark progress is already saved automatically. Open Recovery "
+                "to resume it; do not downgrade its checkpoint to a draft scan."
+            )
+            return
+        try:
+            self.commit_table_edit()
+            self._capture_selected_item_draft()
+            state = "confirmed" if self.case_decision else "manually_saved"
+            if (not self.current_scan_id or
+                    not self.workflow_store.get_scan(self.current_scan_id)):
+                self.current_scan_id = self.workflow_store.start_scan(
+                    platform=self.current_platform,
+                    search_by=self.current_search_mode,
+                    search_input=self.order_url_entry.get().strip(),
+                    order_id=self.current_order_id,
+                    return_case=self.return_case or {},
+                    items=self.returned_products,
+                    new_stock_destination=self.new_stock_destination,
+                )
+            snapshot = self._workflow_snapshot(state)
+            # Recovery is the authoritative record. Write/verify it first.
+            self.workflow_store.save_restore_point(self.current_scan_id, snapshot)
+            verified = self.workflow_store.get_restore_point(self.current_scan_id)
+            if not verified or verified.get("order_id") != self.current_order_id:
+                raise RuntimeError("Saved recovery record could not be verified.")
+            try:
+                saved = self.workflow_store.update_scan(
+                    self.current_scan_id,
+                    workflow_state=state,
+                    items=snapshot["items"],
+                    case_decision=snapshot["case_decision"],
+                    new_stock_destination=snapshot["new_stock_destination"],
+                    odoo_results=snapshot["odoo_results"],
+                    odoo_checkpoint=snapshot["odoo_checkpoint"],
+                    lark_results=snapshot["lark_results"],
+                    normal_lark_results=snapshot["normal_lark_results"],
+                    wrong_item_lark_results=snapshot["wrong_item_lark_results"],
+                    last_error="",
+                    return_case=snapshot["return_case"],
+                )
+                if not saved:
+                    raise RuntimeError("Scan History record could not be updated")
+            except Exception as error:
+                # Restore is already durably written; warn without losing it.
+                messagebox.showwarning(
+                    "Scan Saved With History Warning",
+                    "Recovery snapshot was saved, but Scan History could not "
+                    f"be updated: {error}",
+                )
+            self._refresh_restore_button()
+            self.set_status(
+                f"Saved {self.current_order_id} for Recovery "
+                f"(New destination: {self.new_stock_destination})."
+            )
+            messagebox.showinfo(
+                "Saved for Recovery",
+                f"Order {self.current_order_id} was saved. Use Recovery to "
+                "restore this scan later. No Odoo or Lark action was taken."
+            )
+        except Exception as error:
+            self.set_status("Save for Recovery failed; no Odoo/Lark action was taken.")
+            messagebox.showerror("Save for Recovery Failed", str(error))
 
     # =========================================================
     # JSON HISTORY / RECOVERY
@@ -1742,6 +2166,7 @@ class ReturnProcessorApp(tk.Tk):
                 order_id=self.current_order_id,
                 return_case=self.return_case or {},
                 items=self.returned_products,
+                new_stock_destination=self.new_stock_destination,
             )
             self._refresh_restore_button()
         except Exception as error:
@@ -1758,9 +2183,12 @@ class ReturnProcessorApp(tk.Tk):
             "return_case": copy.deepcopy(self.return_case or {}),
             "items": copy.deepcopy(self.returned_products),
             "case_decision": copy.deepcopy(self.case_decision),
+            "new_stock_destination": self.new_stock_destination,
             "odoo_results": copy.deepcopy(self.odoo_results),
             "odoo_checkpoint": copy.deepcopy(self.odoo_checkpoint),
             "lark_results": copy.deepcopy(self.lark_results),
+            "normal_lark_results": copy.deepcopy(self.normal_lark_results),
+            "wrong_item_lark_results": copy.deepcopy(self.wrong_item_lark_results),
             "transfer_display": self.transfer_id_label.cget("text"),
             "status_text": self.status_label.cget("text"),
             "last_error": str(last_error or ""),
@@ -1772,17 +2200,33 @@ class ReturnProcessorApp(tk.Tk):
             return
         snapshot = self._workflow_snapshot(workflow_state, last_error=last_error)
         try:
-            self.workflow_store.update_scan(
+            updated = self.workflow_store.update_scan(
                 self.current_scan_id,
                 workflow_state=workflow_state,
                 items=snapshot["items"],
                 case_decision=snapshot["case_decision"],
+                new_stock_destination=snapshot["new_stock_destination"],
                 odoo_results=snapshot["odoo_results"],
                 odoo_checkpoint=snapshot["odoo_checkpoint"],
                 lark_results=snapshot["lark_results"],
+                normal_lark_results=snapshot["normal_lark_results"],
+                wrong_item_lark_results=snapshot["wrong_item_lark_results"],
                 last_error=snapshot["last_error"],
                 return_case=snapshot["return_case"],
             )
+            if not updated:
+                raise RuntimeError('Scan History JSON did not update this scan ID.')
+            # Never remove the durable Recovery point for a completed filing
+            # until its original history record confirms the final Lark result.
+            if workflow_state == 'completed':
+                verified_scan = self.workflow_store.get_scan(self.current_scan_id)
+                if (not verified_scan or
+                        verified_scan.get('workflow_state') != 'completed' or
+                        verified_scan.get('lark_results') != snapshot['lark_results']):
+                    raise RuntimeError(
+                        'Scan History completion could not be verified. '
+                        'Retaining Recovery data to prevent lost audit records.'
+                    )
             if keep_restore:
                 self.workflow_store.save_restore_point(
                     self.current_scan_id,
@@ -1795,6 +2239,232 @@ class ReturnProcessorApp(tk.Tk):
             print(f"JSON workflow save failed: {error}")
         finally:
             self._refresh_restore_button()
+
+    def _persist_lark_progress_strict(self):
+        """Persist per-form successes before proceeding to the next Lark form.
+
+        The existing _persist_workflow is best-effort for status messages; it
+        must not be used to protect irreversible multi-form submissions.
+        """
+        if not self.current_scan_id:
+            raise RuntimeError("Missing scan ID; Lark filing has not started.")
+        snapshot = self._workflow_snapshot("lark_pending")
+        self.workflow_store.save_restore_point(self.current_scan_id, snapshot)
+        saved = self.workflow_store.get_restore_point(self.current_scan_id)
+        for field in ("order_id", "items", "normal_lark_results",
+                      "wrong_item_lark_results", "odoo_results"):
+            if not saved or saved.get(field) != snapshot.get(field):
+                raise RuntimeError(
+                    f"Cannot verify {field} in Recovery JSON. Inspect Lark "
+                    "before retrying; submission outcome may be uncertain."
+                )
+        self.workflow_store.update_scan(
+            self.current_scan_id, workflow_state="lark_pending",
+            items=snapshot["items"], case_decision=snapshot["case_decision"],
+            new_stock_destination=snapshot["new_stock_destination"],
+            odoo_results=snapshot["odoo_results"],
+            odoo_checkpoint=snapshot["odoo_checkpoint"],
+            lark_results=snapshot["lark_results"],
+            normal_lark_results=snapshot["normal_lark_results"],
+            wrong_item_lark_results=snapshot["wrong_item_lark_results"],
+            return_case=snapshot["return_case"],
+        )
+
+    def _save_odoo_checkpoint_event(self, checkpoint, event):
+        """Durably record every Odoo ticket/return milestone BEFORE proceeding.
+
+        Unlike the ordinary best-effort history logger, a failed checkpoint
+        write must stop Odoo: continuing would risk creating an untracked
+        Helpdesk ticket or an untracked TC/IN after a crash.
+        """
+        states = {
+            "manual_review": "manual_review",
+            "odoo_ticket_created": "odoo_ticket_created",
+            "odoo_ticket_setup_pending": "odoo_ticket_setup_pending",
+            "odoo_ticket_ready": "odoo_ticket_ready",
+            "odoo_return_pending": "odoo_return_pending",
+            "odoo_returns_complete": "lark_pending",
+        }
+        if event not in states:
+            raise ValueError(f"Unexpected Odoo checkpoint event: {event}")
+        state = states[event]
+        saved = copy.deepcopy(checkpoint)
+        if event == "odoo_returns_complete":
+            self.odoo_results = saved
+            self.odoo_checkpoint = None
+        else:
+            self.odoo_checkpoint = saved
+            self.odoo_results = None
+
+        # Even if the initial scan-history write failed, establish a durable
+        # scan ID before any more Odoo side effects are permitted.
+        if not self.current_scan_id:
+            self.current_scan_id = self.workflow_store.start_scan(
+                platform=self.current_platform,
+                search_by=self.current_search_mode,
+                search_input=self.order_url_entry.get().strip(),
+                order_id=self.current_order_id,
+                return_case=self.return_case or {},
+                items=self.returned_products,
+                new_stock_destination=self.new_stock_destination,
+            )
+
+        snapshot = self._workflow_snapshot(state)
+        # Save the recovery record FIRST. Scan history is an audit mirror;
+        # the restore point is what prevents a duplicate ticket/transfer.
+        try:
+            self.workflow_store.save_restore_point(self.current_scan_id, snapshot)
+        except Exception:
+            # Fail closed on a disk failure. Any previously saved in-flight
+            # checkpoint remains the recovery authority; never let the UI
+            # treat an unsaved return as safe to recreate.
+            self.odoo_results = None
+            self.odoo_checkpoint = copy.deepcopy(saved)
+            self.odoo_checkpoint["stage"] = "manual_review"
+            self.odoo_checkpoint["resume_safe"] = False
+            raise
+        try:
+            self.workflow_store.update_scan(
+                self.current_scan_id,
+                workflow_state=state,
+                items=snapshot["items"],
+                case_decision=snapshot["case_decision"],
+                new_stock_destination=snapshot["new_stock_destination"],
+                odoo_results=snapshot["odoo_results"],
+                odoo_checkpoint=snapshot["odoo_checkpoint"],
+                lark_results=snapshot["lark_results"],
+                normal_lark_results=snapshot["normal_lark_results"],
+                wrong_item_lark_results=snapshot["wrong_item_lark_results"],
+                return_case=snapshot["return_case"],
+            )
+        except Exception as error:
+            # The durable restore point was saved; History can reconstruct
+            # the scan from it even if the audit-file update fails.
+            print(f"Scan history mirror failed after Odoo checkpoint: {error}")
+        if event == "odoo_ticket_created":
+            # Show the existing ticket immediately, even before product setup.
+            self._render_odoo_checkpoint()
+        self._refresh_restore_button(busy=True)
+        print(
+            "ODOO JSON RESTORE POINT SAVED:",
+            event,
+            saved.get("ticket_url") or saved.get("ticket_title"),
+        )
+
+    @staticmethod
+    def _odoo_pause_state(checkpoint):
+        if not checkpoint.get("resume_safe", False):
+            return "manual_review"
+        if checkpoint.get("stage") in {"ticket_created", "ticket_setup_pending"}:
+            return "odoo_ticket_setup_pending"
+        return "odoo_return_pending"
+
+    def _find_saved_odoo_workflow(self):
+        """Find previous Odoo work INCLUDING records archived from the GUI.
+
+        A rescanned order uses a different scan ID. Archived audit records
+        must continue protecting against a duplicate Helpdesk ticket.
+        """
+        matches = self.workflow_store.find_prior_odoo_scans(
+            self.current_platform, self.current_order_id,
+            exclude_scan_id=self.current_scan_id,
+        )
+        return matches[0] if matches else None
+
+    def _resolve_saved_odoo_duplicate(self, previous):
+        """Display safe choices; only a one-off audited exception may continue.
+
+        Returns True solely after the operator explicitly approves a separate
+        return and the exception has been durably written to scan_history.json.
+        No Odoo action is performed by this dialog itself.
+        """
+        prior_id = previous.get("scan_id")
+        if not prior_id:
+            messagebox.showerror("Missing Audit ID", "Existing Odoo case has no scan ID.")
+            return False
+        dialog = DuplicateTicketResolutionDialog(
+            self, order_id=self.current_order_id,
+            platform=self.current_platform, previous=previous,
+        )
+        self.wait_window(dialog)
+        choice = dialog.choice
+        if choice == "cancel":
+            return False
+        if choice == "inspect":
+            self.open_history_window(focus_scan_id=prior_id)
+            return False
+        if choice == "recover":
+            if previous.get("archived"):
+                if not messagebox.askyesno(
+                    "Recover Archived Odoo Case",
+                    "Unarchive the previous scan and restore its existing "
+                    "Odoo ticket/checkpoint for manual review? No new ticket "
+                    "or transfer will be created.", parent=self,
+                ):
+                    return False
+                try:
+                    result = self.workflow_store.reactivate_archived_record(prior_id)
+                    self._refresh_restore_button()
+                except Exception as error:
+                    messagebox.showerror("Cannot Reopen Archived Case", str(error), parent=self)
+                    return False
+                if not result.get("recoverable"):
+                    self.open_history_window(focus_scan_id=prior_id)
+                    messagebox.showinfo(
+                        "Review Previous Ticket",
+                        "This archived record is visible again, but no safe "
+                        "Recovery snapshot could be reconstructed. Inspect the "
+                        "saved Odoo ticket and use the existing manual filing path.",
+                        parent=self,
+                    )
+                    return False
+            if self.workflow_store.get_restore_point(prior_id):
+                self.restore_saved_workflow(prior_id)
+            else:
+                self.open_history_window(focus_scan_id=prior_id)
+                messagebox.showinfo(
+                    "No Automatic Recovery",
+                    "The existing ticket was preserved, but there is no "
+                    "active recovery checkpoint. Review its Odoo/Scan History record.",
+                    parent=self,
+                )
+            return False
+        if choice != "new_ticket":
+            return False
+        try:
+            # Save the up-to-date local scan and operator exception BEFORE
+            # any Odoo side effect, so the deliberate override is auditable.
+            if not self.current_scan_id or not self.workflow_store.get_scan(self.current_scan_id):
+                self.current_scan_id = self.workflow_store.start_scan(
+                    platform=self.current_platform,
+                    search_by=self.current_search_mode,
+                    search_input=self.order_url_entry.get().strip(),
+                    order_id=self.current_order_id,
+                    return_case=self.return_case or {},
+                    items=self.returned_products,
+                    new_stock_destination=self.new_stock_destination,
+                )
+            updated = self.workflow_store.update_scan(
+                self.current_scan_id, items=copy.deepcopy(self.returned_products),
+                case_decision=copy.deepcopy(self.case_decision),
+                return_case=copy.deepcopy(self.return_case or {}),
+                new_stock_destination=self.new_stock_destination,
+            )
+            if not updated:
+                raise RuntimeError("Current scan could not be saved for audit.")
+            self.workflow_store.record_duplicate_override(
+                self.current_scan_id, prior_scan_id=prior_id,
+                typed_order_id=dialog.typed_order_id,
+                reason=dialog.reason, confirmation=dialog.confirmation,
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "New Ticket Blocked",
+                "Could not save/verify the mandatory separate-return audit: "
+                f"{error}. No new Odoo ticket was created.", parent=self,
+            )
+            return False
+        return True
 
     def _refresh_restore_button(self, busy=False):
         """Refresh both top-toolbar and existing in-form recovery shortcuts."""
@@ -1810,6 +2480,19 @@ class ReturnProcessorApp(tk.Tk):
         label = f"Recovery ({count})" if count else "Recovery"
         self.recovery_toolbar_button.config(text=label, state=button_state)
         self.history_toolbar_button.config(state="disabled" if is_busy else "normal")
+        self.settings_button.config(state="disabled" if is_busy else "normal")
+        self.save_scan_button.config(
+            state=("normal" if self.current_order_id and self.returned_products
+                   and not is_busy and not (self.lark_results or
+                   self.normal_lark_results or self.wrong_item_lark_results)
+                   and not (self.odoo_checkpoint or self.odoo_results)
+                   else "disabled")
+        )
+        self.new_stock_destination_combo.config(
+            state=("readonly" if self.current_order_id and not is_busy
+                   and not (self.odoo_results or self.odoo_checkpoint)
+                   else "disabled")
+        )
         self.restore_workflow_button.config(
             text=(f"Browse Pending ({count})" if count else "Browse Pending"),
             state=button_state,
@@ -1822,7 +2505,7 @@ class ReturnProcessorApp(tk.Tk):
         """Open all pending cases so the operator can select one to resume."""
         self.open_history_window(pending_only=True)
 
-    def open_history_window(self, pending_only=False):
+    def open_history_window(self, pending_only=False, focus_scan_id=None):
         """Show a single non-modal history and recovery browser."""
         if self._processing_busy:
             messagebox.showwarning(
@@ -1834,6 +2517,8 @@ class ReturnProcessorApp(tk.Tk):
             if pending_only:
                 window.status_var.set("Pending / Recoverable")
             window.refresh_from_store()
+            if focus_scan_id:
+                window.focus_record(focus_scan_id)
             window.lift()
             window.focus_set()
             return
@@ -1842,7 +2527,63 @@ class ReturnProcessorApp(tk.Tk):
             store=self.workflow_store,
             on_restore=self.restore_saved_workflow,
             pending_only=pending_only,
+            on_record_changed=self._on_saved_record_changed,
         )
+        if focus_scan_id:
+            self._history_window.focus_record(focus_scan_id)
+
+    def _on_saved_record_changed(self, scan_id, action):
+        """Keep the active workspace consistent when History is edited/deleted."""
+        if self._processing_busy:
+            raise RuntimeError("Cannot change the active case during processing.")
+        if self.current_scan_id == scan_id:
+            if action in {"deleted", "archived"}:
+                self.reset_case()
+                self.order_id_label.config(text="Not loaded")
+                self.product_value_label.config(text="Not loaded")
+                self.set_status("Current scan removed from active workspace.")
+                self._sync_action_buttons()
+            elif action == "reset_for_resubmission":
+                # The operator explicitly reconciled the old Odoo work and
+                # reset its local checkpoint. Reload exactly this scan in a
+                # fresh, unconfirmed state; never auto-submit it.
+                latest = (self.workflow_store.get_restore_point(scan_id)
+                          or self.workflow_store.get_scan(scan_id))
+                if not latest or latest.get("odoo_checkpoint") or latest.get("odoo_results"):
+                    raise RuntimeError("Odoo reset was not verified; do not submit.")
+                self._load_restored_snapshot(latest)
+                self.set_status(
+                    "Odoo checkpoint reset after operator review. "
+                    "Review items and click Confirm All Items before Submit."
+                )
+            elif action in {"made_recoverable", "manual_odoo_entered"}:
+                # History/Recovery is authoritative after manual Odoo edits.
+                # Refresh the SAME open scan, never submit or click Odoo.
+                latest = (self.workflow_store.get_restore_point(scan_id)
+                          or self.workflow_store.get_scan(scan_id))
+                if not latest:
+                    raise RuntimeError("Saved recovery entry is missing after update.")
+                self._load_restored_snapshot(latest)
+                if action == "manual_odoo_entered":
+                    self.set_status(
+                        "Manual Odoo transfer identities saved. Inspect them, "
+                        "then use Confirm Existing TC/IN & File Lark. "
+                        "No Odoo action will be repeated."
+                    )
+            elif action == "edited":
+                # External work is immutable; a notes-only edit should not
+                # throw away any unrelated in-progress on-screen values.
+                if not (self.odoo_checkpoint or self.odoo_results or self.lark_results
+                        or self.normal_lark_results or self.wrong_item_lark_results):
+                    latest = (self.workflow_store.get_restore_point(scan_id)
+                              or self.workflow_store.get_scan(scan_id))
+                    if latest:
+                        self._load_restored_snapshot(latest)
+                        self.set_status(
+                            "Saved scan was edited in History. Review and "
+                            "Confirm All Items again before Submit."
+                        )
+        self._refresh_restore_button()
 
     def restore_latest_workflow(self):
         """Compatibility shortcut: show the picker instead of auto-restoring."""
@@ -1889,9 +2630,13 @@ class ReturnProcessorApp(tk.Tk):
             for item in items
         )
         if (
-            (state in {"odoo_return_pending", "manual_review"} and not checkpoint)
+            (state in {"odoo_return_pending", "odoo_ticket_created",
+                       "odoo_ticket_setup_pending", "odoo_ticket_ready",
+                       "manual_review"} and not checkpoint)
             or (state == "lark_pending" and returned_items and not odoo_result)
-            or (state in {"odoo_return_pending", "manual_review", "lark_pending"}
+            or (state in {"odoo_return_pending", "odoo_ticket_created",
+                         "odoo_ticket_setup_pending", "odoo_ticket_ready",
+                         "manual_review", "lark_pending"}
                 and not snapshot.get("case_decision"))
         ):
             messagebox.showerror(
@@ -1983,10 +2728,18 @@ class ReturnProcessorApp(tk.Tk):
         self.current_order_id = str(snapshot.get("order_id") or "").strip() or None
         self.return_case = copy.deepcopy(snapshot.get("return_case") or {})
         self.returned_products = copy.deepcopy(snapshot.get("items") or [])
+        # Missing field means a pre-v1.0.4 scan, which always used MNL/Stock.
+        self.new_stock_destination = normalize_new_stock_destination(
+            snapshot.get("new_stock_destination"),
+            default=DEFAULT_NEW_STOCK_DESTINATION,
+        )
+        self.new_stock_destination_combo.set(self.new_stock_destination)
         self.case_decision = copy.deepcopy(snapshot.get("case_decision"))
         self.odoo_results = copy.deepcopy(snapshot.get("odoo_results"))
         self.odoo_checkpoint = copy.deepcopy(snapshot.get("odoo_checkpoint"))
         self.lark_results = copy.deepcopy(snapshot.get("lark_results") or [])
+        self.normal_lark_results = copy.deepcopy(snapshot.get("normal_lark_results") or [])
+        self.wrong_item_lark_results = copy.deepcopy(snapshot.get("wrong_item_lark_results") or [])
 
         self.order_id_label.config(text=self.current_order_id or "Not loaded")
         refund_text = str((self.return_case or {}).get("refund_text") or "Not loaded")
@@ -2026,14 +2779,41 @@ class ReturnProcessorApp(tk.Tk):
 
         self._sync_action_buttons()
         if self.odoo_checkpoint and self.odoo_checkpoint.get("resume_safe", False):
+            if self.odoo_checkpoint.get("stage") in {
+                "ticket_created", "ticket_setup_pending",
+            }:
+                message = (
+                    f"Restored {self.current_order_id}. The existing Odoo ticket "
+                    "needs product/tag setup. Click Retry Odoo Return & Continue."
+                )
+            else:
+                message = (
+                    f"Restored {self.current_order_id}. Validate inventory if "
+                    "needed, then click Retry Odoo Return & Continue."
+                )
+        elif (self.odoo_checkpoint and self.odoo_checkpoint.get("manual_entry")
+              and self.odoo_checkpoint.get("returns")):
             message = (
-                f"Restored {self.current_order_id}. Validate inventory if needed, "
-                "then click Retry Odoo Return & Continue."
+                f"Restored {self.current_order_id} with operator-entered TC/IN "
+                "details. Review ticket, SKU/QTY, QC/warehouse handoff and "
+                "Lark history, then click Confirm Existing TC/IN & File Lark. "
+                "Odoo will not run again."
+            )
+        elif self.odoo_checkpoint and self._recorded_existing_draft():
+            recorded = self._recorded_existing_draft()
+            message = (
+                f"Restored {self.current_order_id}. Existing draft "
+                f"{recorded['transfer_id']} is recorded. Use Recover Existing "
+                "Transfer after inspecting Odoo. To start a NEW submission "
+                "after removing prior Odoo work, use Scan History > "
+                "Reset Odoo for Re-submit."
             )
         elif self.odoo_checkpoint:
             message = (
                 f"Restored {self.current_order_id} for manual Odoo review. "
-                "Automatic return retry is disabled."
+                "No verified draft identifier is recorded; retry is disabled. "
+                "After removing prior Odoo work, use Scan History > "
+                "Reset Odoo for Re-submit to start a new submission."
             )
         elif state == "lark_pending":
             message = (
@@ -2058,7 +2838,13 @@ class ReturnProcessorApp(tk.Tk):
         self.odoo_results = None
         self.odoo_checkpoint = None
         self.lark_results = []
+        self.normal_lark_results = []
+        self.wrong_item_lark_results = []
         self.current_scan_id = None
+        # New scans inherit the current application default; restored scans
+        # will overwrite this with their originally selected location.
+        self.new_stock_destination = self.app_settings['new_stock_destination']
+        self.new_stock_destination_combo.set(self.new_stock_destination)
         self.clear_products_table()
         self.clear_item_editor()
         self.set_item_controls_enabled(
@@ -2185,8 +2971,13 @@ class ReturnProcessorApp(tk.Tk):
             "1.0",
             item.get("remarks", ""),
         )
+        self.wrong_item_status_combo.set(item.get("wrong_item_status", ""))
+        self.received_item_text.config(state="normal")
+        self.received_item_text.delete("1.0", tk.END)
+        self.received_item_text.insert("1.0", item.get("received_item", ""))
         self.update_grade_state()
         self.update_odoo_tag_state()
+        self._layout_wrong_item_controls()
     def _ensure_item_list_mutable(self):
         """
 
@@ -2197,7 +2988,8 @@ class ReturnProcessorApp(tk.Tk):
         data already committed in Odoo.
 
         """
-        if self.odoo_results or self.odoo_checkpoint:
+        if (self.odoo_results or self.odoo_checkpoint or
+                self.normal_lark_results or self.wrong_item_lark_results):
             messagebox.showwarning(
                 "Odoo Workflow Locked",
                 (
@@ -2208,6 +3000,104 @@ class ReturnProcessorApp(tk.Tk):
             )
             return False
         return True
+    def _mark_tiktok_selection_changed(self):
+        """An intentional row edit needs fresh financial/source confirmation."""
+        if (self.current_platform == "TikTok"
+                and isinstance(self.return_case, dict)
+                and self.return_case.get("value_mode") == "tiktok_return_groups"):
+            self.return_case["tiktok_selection_pending"] = True
+            self.return_case.pop("tiktok_manual_selection", None)
+
+    def _confirm_edited_tiktok_selection(self, *, lark_only=False) -> bool:
+        """Explicitly approve a subset; do NOT alter any existing Odoo record.
+
+        Original return-card totals and IDs remain intact. The chosen SKU/QTY
+        and independently entered refund Amount are recorded and fingerprinted
+        in Scan History / Recovery. Nothing is filed by this dialog.
+        """
+        if (self.current_platform != "TikTok" or
+                (self.return_case or {}).get("value_mode") != "tiktok_return_groups"):
+            return False
+        try:
+            summary = preview_tiktok_manual_selection(
+                self.return_case, self.returned_products,
+            )
+        except ValueError as error:
+            messagebox.showerror(
+                "TikTok Edited Selection Cannot Be Filed",
+                f"{error}\n\nCorrect the retained items first. "
+                "The original return cards and Odoo records are unchanged.",
+                parent=self,
+            )
+            return False
+
+        remaining_ids = len(summary["selected_return_quantities"])
+        excluded_ids = summary["excluded_return_ids"]
+        omitted = (", ".join(excluded_ids[:5]) or "None")
+        if len(excluded_ids) > 5:
+            omitted += f" (+{len(excluded_ids)-5} more)"
+        prompt = (
+            f"Order: {self.current_order_id}\n\n"
+            f"Original TikTok source: {summary['source_units']} unit(s) / "
+            f"{summary['source_return_count']} return card(s); "
+            f"PHP {summary['source_refund']:,.2f}.\n"
+            f"Manually selected: {summary['selected_units']} unit(s) / "
+            f"{remaining_ids} return card(s); "
+            f"PHP {summary['selected_refund']:,.2f}.\n"
+            f"Excluded return cards: {omitted}\n\n"
+            "File ONLY the selected SKU(s) using their entered Amounts?\n"
+            "Excluded items are NOT being filed. Original source values "
+            "remain in audit history.\n\n"
+            + ("Odoo is already complete and WILL NOT be run again.\n"
+               if lark_only else
+               "Only the confirmed selected items will be sent to Odoo/Lark.\n")
+            + "Review any existing Lark filings before retrying."
+        )
+        if not messagebox.askyesno(
+            "Confirm Edited TikTok Return Selection", prompt, parent=self,
+        ):
+            return False
+        reason = simpledialog.askstring(
+            "Reason for Edited Selection",
+            "Explain why some TikTok return items were removed/edited "
+            "(saved in the scan audit record):",
+            parent=self,
+        )
+        if reason is None:
+            return False
+        typed = simpledialog.askstring(
+            "Confirm Marketplace Order ID",
+            f"Type the exact Order ID {self.current_order_id} to confirm "
+            "that only the selected items should be filed:",
+            parent=self,
+        )
+        if typed is None or typed.strip() != self.current_order_id:
+            messagebox.showwarning(
+                "Confirmation Not Matched",
+                "Order ID confirmation did not match. Nothing was authorized.",
+                parent=self,
+            )
+            return False
+        try:
+            approval = confirm_tiktok_manual_selection(
+                self.return_case, self.returned_products, reason,
+            )
+            self.return_case["tiktok_manual_selection"] = approval
+            self.return_case.pop("tiktok_selection_pending", None)
+            verify_tiktok_source_coverage(
+                self.return_case, self.returned_products,
+            )
+        except ValueError as error:
+            self.return_case.pop("tiktok_manual_selection", None)
+            messagebox.showerror("Selection Confirmation Failed", str(error), parent=self)
+            return False
+        self.set_status(
+            f"TikTok selection confirmed: {summary['selected_units']} unit(s), "
+            f"PHP {summary['selected_refund']:,.2f}. "
+            "Original return cards retained for audit."
+        )
+        return True
+
     def add_return_item(self):
         """
 
@@ -2248,6 +3138,7 @@ class ReturnProcessorApp(tk.Tk):
         self.returned_products.append(
             new_item
         )
+        self._mark_tiktok_selection_changed()
         new_index = (
             len(self.returned_products) - 1
         )
@@ -2324,6 +3215,7 @@ class ReturnProcessorApp(tk.Tk):
         self.returned_products.pop(
             index
         )
+        self._mark_tiktok_selection_changed()
         self.invalidate_confirmation()
         self.populate_products_table()
         if self.returned_products:
@@ -2472,6 +3364,8 @@ class ReturnProcessorApp(tk.Tk):
                 value,
                 2,
             )
+        if self.returned_products[index].get(column) != value:
+            self._mark_tiktok_selection_changed()
         self.returned_products[index][column] = value
         self.table_editor.destroy()
         self.table_editor = None
@@ -2549,6 +3443,7 @@ class ReturnProcessorApp(tk.Tk):
             self.grade_combo.config(
                 state="disabled",
             )
+        self._layout_wrong_item_controls()
     def clear_item_editor(self):
         self.amount_entry.config(
             state="normal",
@@ -2569,18 +3464,32 @@ class ReturnProcessorApp(tk.Tk):
             "1.0",
             tk.END,
         )
+        self.wrong_item_status_combo.set("")
+        self.received_item_text.config(state="normal")
+        self.received_item_text.delete("1.0", tk.END)
+        self._layout_wrong_item_controls()
     def on_classification_changed(self, _event=None):
         self.update_grade_state()
+        self.update_odoo_tag_state()
+        if (self.classification_combo.get().strip() in WRONG_ITEM_CLASSIFICATIONS
+                and not self.wrong_item_status_combo.get().strip()):
+            self.wrong_item_status_combo.set(
+                default_wrong_item_status(self.decision_combo.get())
+            )
+        self._layout_wrong_item_controls()
     def on_status_changed(self, _event=None):
         self.update_odoo_tag_state()
     def update_odoo_tag_state(self):
         controls_enabled = (
             str(self.classification_combo.cget("state")) != "disabled"
         )
+        if self.classification_combo.get().strip() in WRONG_ITEM_CLASSIFICATIONS:
+            self.odoo_tag_combo.set("")
         self.odoo_tag_combo.config(
             state=(
                 "readonly"
                 if controls_enabled
+                and self.classification_combo.get().strip() not in WRONG_ITEM_CLASSIFICATIONS
                 and self.return_status_combo.get().strip() == RETURNED_STATUS
                 else "disabled"
             )
@@ -2640,7 +3549,7 @@ class ReturnProcessorApp(tk.Tk):
             raise ValueError(
                 f"Select Classification for {item['sku']}."
             )
-        if status == RETURNED_STATUS and not odoo_tag:
+        if status == RETURNED_STATUS and not odoo_tag and classification not in WRONG_ITEM_CLASSIFICATIONS:
             raise ValueError(
                 f"Select Odoo Tag for returned item {item['sku']}."
             )
@@ -2652,6 +3561,13 @@ class ReturnProcessorApp(tk.Tk):
             raise ValueError(
                 f"Select Status for {item['sku']}."
             )
+        received_item = self.received_item_text.get("1.0", tk.END).strip()
+        special_status = self.wrong_item_status_combo.get().strip()
+        if classification in WRONG_ITEM_CLASSIFICATIONS:
+            if not received_item:
+                raise ValueError(f"Enter Received Item for {item['sku']}.")
+            if special_status not in WRONG_ITEM_STATUSES:
+                raise ValueError(f"Select a Wrong Item / Scam Status for {item['sku']}.")
         if classification == "Unsealed" and not grade:
             raise ValueError(
                 f"Select Grade for unsealed item {item['sku']}."
@@ -2665,6 +3581,8 @@ class ReturnProcessorApp(tk.Tk):
             "platform": item.get("platform") or self.current_platform,
             "grade": grade,
             "remarks": remarks,
+            "received_item": received_item,
+            "wrong_item_status": special_status,
         }
     def save_selected_item(self):
         if not self._ensure_item_list_mutable():
@@ -2677,6 +3595,8 @@ class ReturnProcessorApp(tk.Tk):
                     "Select a returned item first."
                 )
             changes = self.read_item_editor()
+            if self.returned_products[index].get("amount") != changes.get("amount"):
+                self._mark_tiktok_selection_changed()
             self.returned_products[index].update(
                 changes
             )
@@ -2704,6 +3624,8 @@ class ReturnProcessorApp(tk.Tk):
                 )
             changes = self.read_item_editor()
             # Save the selected item's amount too.
+            if self.returned_products[index].get("amount") != changes.get("amount"):
+                self._mark_tiktok_selection_changed()
             self.returned_products[index].update(
                 changes
             )
@@ -2717,7 +3639,9 @@ class ReturnProcessorApp(tk.Tk):
                 "platform",
                 "grade",
                 "remarks",
+                "wrong_item_status",
             )
+            # Actual received item is item-specific and is never bulk-copied.
             for item in self.returned_products:
                 for field in copied_fields:
                     item[field] = changes[field]
@@ -2743,6 +3667,10 @@ class ReturnProcessorApp(tk.Tk):
             raise ValueError(
                 "No returned items are loaded."
             )
+        # Protect against edits, stale Recovery snapshots, and incomplete
+        # TikTok multi-return groups before the irreversible Odoo step.
+        if self.current_platform == "TikTok":
+            verify_tiktok_source_coverage(self.return_case, self.returned_products)
         # Duplicate SKUs are intentionally allowed.
         #
         # Example:
@@ -2795,6 +3723,7 @@ class ReturnProcessorApp(tk.Tk):
             # and will actually be filed into Odoo.
             if (
                 str(item.get("status", "")).strip() == RETURNED_STATUS
+                and not is_wrong_item(item)
                 and not str(item.get("odoo_tag", "")).strip()
             ):
                 raise ValueError(
@@ -2807,12 +3736,15 @@ class ReturnProcessorApp(tk.Tk):
                 raise ValueError(
                     f"Grade is required for unsealed item {sku}."
                 )
+            if is_wrong_item(item):
+                plan_wrong_item_filings(self.current_order_id, [item])
     def returned_items_for_odoo(self):
         """Items that physically came back and therefore require Odoo."""
         return [
             item
             for item in self.returned_products
-            if str(item.get("status", "")).strip() == RETURNED_STATUS
+            if (str(item.get("status", "")).strip() == RETURNED_STATUS
+                and not is_wrong_item(item))
         ]
     def not_returned_items(self):
         """Items that require Lark filing but no Odoo stock return."""
@@ -2821,14 +3753,67 @@ class ReturnProcessorApp(tk.Tk):
             for item in self.returned_products
             if str(item.get("status", "")).strip() != RETURNED_STATUS
         ]
+    def _recorded_existing_draft(self):
+        """Return only an explicitly recorded, uncertain TC/IN for recovery.
+
+        This never makes ordinary Submit safe: the stock transfer already exists.
+        The actual draft state and linked source are checked in odoo.py.
+        """
+        checkpoint = self.odoo_checkpoint or {}
+        pending = checkpoint.get("pending_return") or {}
+        transfer_id = str(pending.get("transfer_id") or "").strip()
+        transfer_url = str(pending.get("transfer_url") or "").strip()
+        if (
+            checkpoint
+            and not checkpoint.get("resume_safe", False)
+            and not self.lark_results
+            and re.fullmatch(r"TC/IN/\d+", transfer_id)
+            and re.match(r"^https://makerlab\.odoo\.com/odoo(?:/|$|[?#])", transfer_url)
+        ):
+            return pending
+        return None
+
     def _sync_action_buttons(self, busy=False):
         """Single source of truth for workflow button availability."""
+        recorded_draft = self._recorded_existing_draft()
         checkpoint_pending = bool(
             self.odoo_checkpoint
             and self.odoo_checkpoint.get("resume_safe", False)
             and not self.lark_results
         )
         workflow_locked = bool(self.odoo_checkpoint)
+        self.resume_odoo_button.config(
+            text=(
+                "Recover Existing " + recorded_draft["transfer_id"]
+                if recorded_draft else "Retry Odoo Return & Continue"
+            )
+        )
+        # When Odoo is already durably recorded, this is a Lark-only
+        # continuation. Do not present an ambiguous Odoo + Lark submission.
+        lark_only = bool((self.odoo_results or self.normal_lark_results or
+                          self.wrong_item_lark_results) and not workflow_locked and
+                         not self.lark_results and self.returned_products)
+        special_count = sum(is_wrong_item(i) for i in self.returned_products)
+        if lark_only:
+            action_label = "Retry Lark Only"
+        elif special_count and special_count == len(self.returned_products):
+            action_label = "File Wrong Item / Scam"
+        elif special_count and self.returned_items_for_odoo():
+            action_label = "Submit Odoo + Both Bases"
+        elif special_count:
+            action_label = "File to Both Lark Bases"
+        else:
+            action_label = "Submit to Odoo + Lark"
+        self.submit_button.config(
+            text=action_label,
+            command=self.retry_lark_only if lark_only else self.submit_case,
+        )
+        if hasattr(self, "manual_lark_button"):
+            manual_entry = bool((self.odoo_checkpoint or {}).get("manual_entry"))
+            self.manual_lark_button.config(
+                text=("Confirm Manual TC/IN & File Lark" if manual_entry
+                      else "Confirm Existing TC/IN & File Lark")
+            )
 
         self.platform_combo.config(
             state="disabled" if busy or workflow_locked else "readonly"
@@ -2839,6 +3824,7 @@ class ReturnProcessorApp(tk.Tk):
                 self.confirm_decision_button: "disabled",
                 self.submit_button: "disabled",
                 self.resume_odoo_button: "disabled",
+                self.manual_lark_button: "disabled",
             }
         else:
             states = {
@@ -2851,16 +3837,21 @@ class ReturnProcessorApp(tk.Tk):
                     else "disabled"
                 ),
                 self.submit_button: (
-                    "normal"
-                    if (
-                        self.case_decision
+                    "normal" if (
+                        (lark_only or self.case_decision)
                         and not self.lark_results
                         and not workflow_locked
-                    )
-                    else "disabled"
+                    ) else "disabled"
                 ),
                 self.resume_odoo_button: (
-                    "normal" if checkpoint_pending else "disabled"
+                    "normal" if (checkpoint_pending or recorded_draft) else "disabled"
+                ),
+                self.manual_lark_button: (
+                    "normal" if (self.case_decision and workflow_locked and
+                                 not self.lark_results and
+                                 not (self.normal_lark_results or self.wrong_item_lark_results) and
+                                 (recorded_draft or self.odoo_checkpoint.get('returns')))
+                    else "disabled"
                 ),
             }
         for button, state in states.items():
@@ -2873,13 +3864,27 @@ class ReturnProcessorApp(tk.Tk):
             if self.selected_item_index() is not None:
                 changes = self.read_item_editor()
                 index = self.selected_item_index()
+                if self.returned_products[index].get("amount") != changes.get("amount"):
+                    self._mark_tiktok_selection_changed()
                 self.returned_products[index].update(
                     changes
                 )
                 self.refresh_product_row(
                     index
                 )
-            self.validate_all_items()
+            try:
+                self.validate_all_items()
+            except ValueError as error:
+                if self.current_platform != "TikTok":
+                    raise
+                try:
+                    verify_tiktok_source_coverage(self.return_case, self.returned_products)
+                except ValueError:
+                    if not self._confirm_edited_tiktok_selection():
+                        return
+                    self.validate_all_items()  # all normal item checks still apply
+                else:
+                    raise error  # unrelated grade, SKU, status, etc. failure
             # Freeze a copy that Odoo/Lark will receive.
             self.returned_products = copy.deepcopy(
                 self.returned_products
@@ -2896,8 +3901,8 @@ class ReturnProcessorApp(tk.Tk):
                 self.odoo_results = None
                 self.odoo_result_label.config(
                     text=(
-                        "Odoo will be skipped: all confirmed items are Not Returned.\n"
-                        "Click Submit to file directly to Lark."
+                        "Odoo will be skipped: no inventory return is required.\n"
+                        "Wrong Item / Scam cases file to their separate Lark Base."
                     ),
                 )
             self._sync_action_buttons()
@@ -2905,9 +3910,14 @@ class ReturnProcessorApp(tk.Tk):
                 "\nCONFIRMED RETURN ITEMS:"
             )
             for item in self.returned_products:
+                amount_text = (
+                    f"{float(item['amount']):.2f}"
+                    if item.get('amount') not in (None, '')
+                    else "not provided"
+                )
                 print(
                     f"{item['sku']} | QTY {item['quantity']} | "
-                    f"Amount {item['amount']:.2f} | "
+                    f"Amount {amount_text} | "
                     f"{item['classification']} | "
                     f"{item['decision']} | {item['odoo_tag']}"
                 )
@@ -2921,8 +3931,8 @@ class ReturnProcessorApp(tk.Tk):
             else:
                 self.set_status(
                     (
-                        "All items are Not Returned. Click Submit to file Lark; "
-                        "Odoo will be skipped automatically."
+                        "No stock transfer is required. File to the applicable "
+                        "Lark Base(s); Odoo will be skipped automatically."
                     )
                 )
         except ValueError as error:
@@ -2933,6 +3943,9 @@ class ReturnProcessorApp(tk.Tk):
     def invalidate_confirmation(self):
         if self.case_decision is None:
             return
+        if self.normal_lark_results or self.wrong_item_lark_results:
+            raise RuntimeError("Lark has already filed part of this case. "
+                               "Item edits are locked; inspect Recovery before continuing.")
         self.case_decision = None
         self.odoo_results = None
         self.odoo_checkpoint = None
@@ -2967,15 +3980,17 @@ class ReturnProcessorApp(tk.Tk):
             if transfer_id and transfer_id not in transfer_ids:
                 transfer_ids.append(transfer_id)
 
+        pending = checkpoint.get("pending_return") or {}
+        pending_draft = str(pending.get("transfer_id") or "").strip()
+        shown_ids = transfer_ids + (
+            [pending_draft] if pending_draft and pending_draft not in transfer_ids else []
+        )
         self.transfer_id_label.config(
             text=(
-                " | ".join(transfer_ids)
-                if transfer_ids
-                else "Return pending - ticket saved"
+                " | ".join(shown_ids)
+                if shown_ids else "Return pending - ticket saved"
             )
         )
-
-        pending = checkpoint.get("pending_return") or {}
         pending_items = ", ".join(
             f"{item.get('sku', '')}_{item.get('quantity', '')}"
             for item in pending.get("items", [])
@@ -2992,20 +4007,41 @@ class ReturnProcessorApp(tk.Tk):
                 f"Pending Return #{pending.get('return_index', '')}: "
                 f"{pending_items}"
             )
+            if pending_draft:
+                lines.append("Existing draft: " + pending_draft)
+                lines.append(str(pending.get("transfer_url") or ""))
         if error_message:
             lines.extend(["", error_message])
         if checkpoint.get("resume_safe", False):
-            lines.extend([
-                "",
-                "Validate the related inventory transaction in Odoo, then click",
-                "Retry Odoo Return & Continue. No new Helpdesk ticket will be created.",
-            ])
+            if checkpoint.get("stage") in {"ticket_created", "ticket_setup_pending"}:
+                lines.extend([
+                    "",
+                    "Existing ticket saved; product/tag/priority setup is pending.",
+                    "Click Retry Odoo Return & Continue to complete ticket setup",
+                    "and then create stock returns. No second ticket is created.",
+                ])
+            else:
+                lines.extend([
+                    "",
+                    "Validate the related inventory transaction in Odoo, then click",
+                    "Retry Odoo Return & Continue. No new Helpdesk ticket will be created.",
+                ])
         else:
-            lines.extend([
-                "",
-                "Manual Odoo review required. Automatic retry is disabled because",
-                "the stock-return state is uncertain. No new ticket is created.",
-            ])
+            if self._recorded_existing_draft():
+                lines.extend([
+                    "",
+                    "A specific TC/IN is recorded. Use Recover Existing TC/IN",
+                    "after checking Odoo. Alternatively, if all recorded",
+                    "returns were completed manually, use Confirm Existing",
+                    "TC/IN & File Lark (operator confirmation required).",
+                    "No duplicate Return or Validate action will be sent.",
+                ])
+            else:
+                lines.extend([
+                    "",
+                    "Manual Odoo review required. No transfer ID and URL were",
+                    "saved, so automatic retry remains disabled. Inspect Odoo.",
+                ])
         self.odoo_result_label.config(text="\n".join(lines))
 
     def _render_odoo_results(self):
@@ -3033,7 +4069,9 @@ class ReturnProcessorApp(tk.Tk):
         )
 
         lines = [
-            "Odoo completed.",
+            ("Odoo manually confirmed for Lark filing (no Odoo retry)."
+             if self.odoo_results.get('manual_lark_reconciliation')
+             else "Odoo completed."),
             f"Ticket: {self.odoo_results['ticket_title']}",
             self.odoo_results["ticket_url"],
             (
@@ -3084,6 +4122,8 @@ class ReturnProcessorApp(tk.Tk):
             case_decision=self.case_decision,
             platform=self.current_platform,
             progress_callback=self.set_status,
+            checkpoint_callback=self._save_odoo_checkpoint_event,
+            new_stock_destination=self.new_stock_destination,
         )
         self.odoo_checkpoint = None
         self._render_odoo_results()
@@ -3101,19 +4141,37 @@ class ReturnProcessorApp(tk.Tk):
             )
         )
     def resume_odoo_workflow(self):
-        """Retry the pending return on the saved ticket, then continue to Lark."""
+        """Retry safe pending work OR explicitly recover the recorded draft."""
         if not self.odoo_checkpoint:
             messagebox.showinfo(
                 "No Restore Point",
                 "There is no pending Odoo return to resume.",
             )
             return
+        recorded_draft = self._recorded_existing_draft()
         if not self.odoo_checkpoint.get("resume_safe", False):
-            messagebox.showwarning(
-                "Manual Review Required",
-                "This restore point is not safe for automatic retry.",
+            if not recorded_draft:
+                messagebox.showwarning(
+                    "Manual Review Required",
+                    "No existing TC/IN ID and URL are recorded for safe "
+                    "draft reconciliation. Do not submit again; inspect Odoo.",
+                )
+                return
+            proceed = messagebox.askyesno(
+                "Recover Existing Odoo Transfer",
+                "Odoo already created a stock return for this order.\n\n"
+                f"Transfer: {recorded_draft['transfer_id']}\n"
+                f"Helpdesk: {self.odoo_checkpoint.get('ticket_title', '')}\n\n"
+                "Before proceeding, confirm this is your existing transfer "
+                "and that it has not already been validated.\n\n"
+                "The processor will open ONLY the recorded transfer and "
+                "require Draft status, matching ticket/delivery, and exact SKU "
+                "quantities. It will then continue stock validation/QC and "
+                "Lark. It will NOT click Return to create a duplicate.\n\n"
+                "Continue with recovery?",
             )
-            return
+            if not proceed:
+                return
         if not self.browser.context:
             messagebox.showerror(
                 "Browser Error",
@@ -3126,14 +4184,21 @@ class ReturnProcessorApp(tk.Tk):
         try:
             self.set_processing_buttons(True)
             self.set_status(
-                "Resuming Odoo from saved ticket; retrying pending return..."
+                ("Recovering recorded existing Odoo draft (no new Return)..."
+                 if recorded_draft else
+                 "Resuming Odoo from saved ticket; retrying pending return...")
             )
-            self.odoo_results = resume_odoo_returns(
+            resume_handler = (
+                recover_existing_odoo_draft
+                if recorded_draft else resume_odoo_returns
+            )
+            self.odoo_results = resume_handler(
                 context=self.browser.context,
                 order_id=self.current_order_id,
                 returned_products=returned_items,
                 checkpoint=self.odoo_checkpoint,
                 progress_callback=self.set_status,
+                checkpoint_callback=self._save_odoo_checkpoint_event,
             )
             self.odoo_checkpoint = None
             self._render_odoo_results()
@@ -3155,12 +4220,12 @@ class ReturnProcessorApp(tk.Tk):
             self.odoo_checkpoint = error.checkpoint
             self._render_odoo_checkpoint(str(error))
             self._persist_workflow(
-                "odoo_return_pending",
+                self._odoo_pause_state(self.odoo_checkpoint),
                 keep_restore=True,
                 last_error=str(error),
             )
             self.set_status(
-                "Odoo return is still pending inventory validation. Restore point kept."
+                "Existing Odoo ticket saved; unfinished work can be resumed."
             )
             messagebox.showwarning(
                 "Odoo Return Still Pending",
@@ -3170,6 +4235,7 @@ class ReturnProcessorApp(tk.Tk):
             if stage == "Odoo":
                 if self.odoo_checkpoint:
                     self.odoo_checkpoint["resume_safe"] = False
+                    self._render_odoo_checkpoint(str(error))
                     self._persist_workflow(
                         "manual_review",
                         keep_restore=True,
@@ -3189,7 +4255,7 @@ class ReturnProcessorApp(tk.Tk):
                 )
             else:
                 retry_message = (
-                    "Odoo is already complete. Press Submit again to retry "
+                    "Odoo is already complete. Use Retry Lark Only to retry "
                     "Lark only; Odoo will not run again."
                 )
                 self._persist_workflow(
@@ -3198,6 +4264,7 @@ class ReturnProcessorApp(tk.Tk):
                     last_error=str(error),
                 )
                 self.set_status("Lark filing failed. " + retry_message)
+                self.set_processing_buttons(False)
                 messagebox.showerror(
                     "Lark Error",
                     f"{error}\n\n{retry_message}",
@@ -3205,56 +4272,371 @@ class ReturnProcessorApp(tk.Tk):
         finally:
             self.set_processing_buttons(False)
 
-    def _run_lark_submit_step(self):
-        """File Lark after Odoo, or directly when nothing was returned."""
-        self.set_status(
-            "Submit 2/2: Filing Lark Item Returns..."
-        )
-        self.lark_results = file_lark_returns(
-            context=self.browser.context,
-            order_id=self.current_order_id,
-            returned_products=self.returned_products,
-            return_case=self.return_case,
-            case_decision=self.case_decision,
-            odoo_results=self.odoo_results,
-            progress_callback=self.set_status,
-        )
-        lines = [
-            self.odoo_result_label.cget("text"),
-            "",
-            (
-                f"Lark filed {len(self.lark_results)} "
-                "record(s):"
-            ),
-        ]
-        for result in self.lark_results:
-            transfer_display = (
-                result["transfer_id"]
-                if result.get("transfer_id")
-                else "No Transfer (Not Returned)"
+    def file_lark_from_verified_transfer(self):
+        """Operator-confirmed Lark-only continuation for an EXISTING TC/IN.
+
+        No Odoo browser navigation, Return, Demand, or Validate action occurs.
+        A durable Lark-pending checkpoint is saved *before* opening Lark.
+        """
+        if self._processing_busy or not self.case_decision:
+            messagebox.showwarning(
+                'Confirmation Required',
+                'Restore the saved case and confirm its item decisions first.',
             )
-            lines.append(
-                (
-                    f"{transfer_display} | "
-                    f"Decision: {result['decision']} | "
-                    f"{result['sku']} | "
-                    f"Total QTY {result['quantity']} | "
-                    f"Order/Refund Value {result['value']:.2f}"
+            return
+        if self.lark_results:
+            messagebox.showinfo('Already Filed', 'Lark results already exist.')
+            return
+        if not self.odoo_checkpoint or not self.current_scan_id:
+            messagebox.showwarning(
+                'No Existing Odoo Checkpoint',
+                'This action requires a saved Odoo transfer in Recovery.',
+            )
+            return
+
+        try:
+            # Disk is authoritative: an in-memory ticket must never override
+            # a different/newer restore point or an already-completed filing.
+            snapshot = self.workflow_store.get_restore_point(self.current_scan_id)
+            if not snapshot or snapshot.get('workflow_state') == 'completed':
+                raise ValueError('Active Recovery record is missing or complete.')
+            if snapshot.get('odoo_checkpoint') != self.odoo_checkpoint:
+                raise ValueError(
+                    'Recovery record changed since this case was restored. '
+                    'Restore it again before confirming a transfer.'
                 )
+            if (snapshot.get('case_decision') != self.case_decision or
+                    snapshot.get('items') != self.returned_products):
+                raise ValueError(
+                    'On-screen item decisions do not match the saved recovery '
+                    'record. Restore the case again before filing Lark.'
+                )
+            if (snapshot.get('lark_results') or snapshot.get('normal_lark_results')
+                    or snapshot.get('wrong_item_lark_results')):
+                raise ValueError('Recovery already contains Lark submissions; use Retry Lark Only.')
+            for old in self.workflow_store.list_recent_scans(limit=None):
+                if (old.get('scan_id') != self.current_scan_id and
+                        old.get('platform') == self.current_platform and
+                        old.get('order_id') == self.current_order_id and
+                        old.get('lark_results')):
+                    raise ValueError(
+                        'Lark results already exist for this marketplace order '
+                        'in Scan History. Inspect the prior filing before retrying.'
+                    )
+            original_checkpoint = self.odoo_checkpoint
+            saved_returns = list(original_checkpoint.get('returns') or [])
+            pending = original_checkpoint.get('pending_return') or {}
+            latest = pending if pending else (saved_returns[-1] if saved_returns else {})
+            latest_id = str(latest.get('transfer_id') or '').strip()
+            # Validate all recorded group identities, quantities and links
+            # even before asking the operator to approve the manual override.
+            candidate = confirm_existing_transfers_for_lark(
+                checkpoint=original_checkpoint,
+                order_id=self.current_order_id,
+                returned_products=self.returned_items_for_odoo(),
+                confirmed_transfer_id=latest_id,
             )
-        lines.extend(
-            [
-                "",
-                "SUBMISSION COMPLETE",
-            ]
+            labels = '\n'.join(
+                f"  Return {entry['return_index']}: {entry['transfer_id']} "
+                f"({entry['classification']}; "
+                + ', '.join(f"{i['sku']} x{i['quantity']}" for i in entry['items'])
+                + ')'
+                for entry in candidate['returns']
+            )
+        except Exception as error:
+            messagebox.showerror('Cannot File Lark Safely', str(error))
+            return
+
+        confirmation = (
+            'MANUAL ODOO RECONCILIATION — LARK ONLY\n\n'
+            f'Order: {self.current_order_id}\n'
+            f'Helpdesk: {candidate.get("ticket_title", "")}\n'
+            f'New-item destination: {candidate.get("new_stock_destination", "MNL/Stock")}\n'
+            f'{labels}\n\n'
+            'Before proceeding, verify in Odoo that ALL the listed transfers '
+            'belong to this ticket, have the correct SKU and quantities, and '
+            'have already completed the relevant validation/warehouse approval '
+            'handoff or required QC.\n\n'
+            'Also confirm these returns were NOT already filed to Lark.\n\n'
+            'This action will NOT create or validate any Odoo transfer. '
+            'It will save an operator-confirmed audit record, then FILE TO LARK.\n\n'
+            'Have you personally verified all of the above?'
         )
-        self.odoo_result_label.config(
-            text="\n".join(lines),
+        if not messagebox.askyesno('Confirm Existing Odoo Work',
+                                   confirmation, parent=self):
+            return
+        typed_id = simpledialog.askstring(
+            'Confirm Recorded Transfer ID',
+            f'Type exactly {latest_id} to authorize Lark filing.\n'
+            'Cancel if the transfer or its processing is uncertain.',
+            parent=self,
         )
-        self._persist_workflow(
-            "completed",
-            keep_restore=False,
+        if typed_id is None:
+            return
+        if typed_id.strip() != latest_id:
+            messagebox.showwarning(
+                'Transfer Not Confirmed',
+                'Entered TC/IN ID did not match the saved transfer. '
+                'No Odoo/Lark action was taken.',
+            )
+            return
+        if not self.browser.context:
+            messagebox.showerror('Browser Error', 'Browser context unavailable.')
+            return
+
+        stage = 'checkpoint'
+        try:
+            self.set_processing_buttons(True)
+            # Recheck the saved point after human confirmation in case another
+            # session has changed it. Multiple simultaneous app instances are
+            # unsupported, but this still catches local stale screens.
+            latest_snapshot = self.workflow_store.get_restore_point(self.current_scan_id)
+            if (not latest_snapshot or
+                    latest_snapshot.get('odoo_checkpoint') != self.odoo_checkpoint or
+                    latest_snapshot.get('lark_results')):
+                raise RuntimeError('Recovery record changed. Restore and retry.')
+            self._save_odoo_checkpoint_event(candidate, 'odoo_returns_complete')
+            verified = self.workflow_store.get_restore_point(self.current_scan_id)
+            if (not verified or verified.get('workflow_state') != 'lark_pending' or
+                    verified.get('odoo_results') != candidate or
+                    verified.get('odoo_checkpoint')):
+                raise RuntimeError(
+                    'Lark-only checkpoint could not be verified. Lark was NOT filed.'
+                )
+            self._render_odoo_results()
+            self.set_status(
+                f'Existing {latest_id} confirmed by operator; filing Lark only...'
+            )
+            stage = 'lark'
+            self._run_lark_submit_step()
+            self.set_status(
+                'Lark filing complete using operator-confirmed existing '
+                'Odoo transfer(s). No Odoo action was repeated.'
+            )
+            # Unlike ordinary status updates, warn if the audit record failed.
+            history = self.workflow_store.get_scan(self.current_scan_id)
+            if (not history or history.get('workflow_state') != 'completed' or
+                    history.get('lark_results') != self.lark_results):
+                messagebox.showwarning(
+                    'Lark Submitted — History Needs Attention',
+                    'Lark submitted successfully, but completion was not '
+                    'confirmed in Scan History JSON. Check Lark and local '
+                    'history before retrying; do not file a duplicate.',
+                )
+        except Exception as error:
+            if stage == 'lark':
+                # Odoo is already marked as complete for this filing, so no
+                # automatic Odoo recovery can trigger a duplicate stock return.
+                self._persist_workflow('lark_pending', keep_restore=True,
+                                       last_error=str(error))
+                messagebox.showerror(
+                    'Lark Filing Error',
+                    f'{error}\n\nExisting Odoo work remains saved. '
+                    'Do not repeat Odoo Return or Validate. If Lark may have '
+                    'partially submitted, check Lark before using Retry Lark Only.',
+                )
+            else:
+                messagebox.showerror(
+                    'Reconciliation Save Error',
+                    f'{error}\n\nLark was not opened. '
+                    'The existing Odoo transfer must not be recreated.',
+                )
+        finally:
+            self.set_processing_buttons(False)
+
+    def retry_lark_only(self):
+        """Continue a saved Odoo-complete case WITHOUT touching Odoo again.
+
+        Do not bypass TikTok group preflight: a partially recovered multi-card
+        order must not be reported in Lark as a complete refund. The operator
+        checks for a previously/partially submitted Lark record first.
+        """
+        if self._processing_busy:
+            return
+        if ((not self.odoo_results and not self.normal_lark_results and
+             not self.wrong_item_lark_results) or self.odoo_checkpoint or
+                not self.returned_products or not self.current_scan_id):
+            messagebox.showwarning(
+                "Lark Retry Unavailable",
+                "Restore an Odoo-complete case before retrying Lark. "
+                "No Odoo action will be repeated.",
+            )
+            return
+        if self.lark_results:
+            messagebox.showinfo("Already Filed", "This case has saved Lark results.")
+            return
+        if not self.browser.context:
+            messagebox.showerror("Browser Error", "Browser context is unavailable.")
+            return
+        # An operator may intentionally exclude/edit TikTok return cards.
+        # Require explicit reconfirmation instead of treating a valid subset
+        # as an automatically incomplete scan. Odoo must NEVER run on retry.
+        try:
+            verify_tiktok_source_coverage(self.return_case, self.returned_products)
+        except ValueError as error:
+            if not self._confirm_edited_tiktok_selection(lark_only=True):
+                self.set_status("TikTok selected items need manual reconciliation before Lark.")
+                return
+            try:
+                verify_tiktok_source_coverage(self.return_case, self.returned_products)
+            except ValueError as check_error:
+                messagebox.showerror("TikTok Reconciliation Failed", str(check_error), parent=self)
+                return
+        if not messagebox.askyesno(
+            "Retry Lark Only",
+            "Existing Odoo work will NOT run again.\n\n"
+            "Before retrying, inspect both Lark Item Returns and the Wrong Item / Scam Base "
+            "to ensure an earlier attempt did not partially submit.\n\n"
+            "Continue with Lark filing only?",
+        ):
+            return
+        error_message = None
+        try:
+            self.set_processing_buttons(True)
+            self._persist_workflow("lark_pending", keep_restore=True)
+            saved_point = self.workflow_store.get_restore_point(self.current_scan_id)
+            if (not saved_point or saved_point.get('workflow_state') != 'lark_pending'
+                    or saved_point.get('odoo_results') != self.odoo_results
+                    or saved_point.get('return_case') != self.return_case
+                    or saved_point.get('items') != self.returned_products
+                    or saved_point.get('odoo_checkpoint')):
+                raise RuntimeError(
+                    'Lark retry checkpoint could not be saved/verified. '
+                    'No Lark browser action was attempted.'
+                )
+            self.set_status("Retrying Lark only. Odoo will not run again...")
+            self._run_lark_submit_step()
+            saved = (self.workflow_store.get_scan(self.current_scan_id)
+                     if self.current_scan_id else None)
+            if not saved or saved.get("workflow_state") != "completed":
+                raise RuntimeError(
+                    "Lark submitted but completed Scan History was not verified. "
+                    "Check Lark and Scan History before any retry."
+                )
+            self.set_status("Lark filing completed. Existing Odoo was untouched.")
+        except Exception as error:
+            error_message = str(error)
+            if self.lark_results:
+                # The browser may already have submitted every Lark record.
+                # Never overwrite that evidence with an ordinary retry state.
+                self.set_status(
+                    "Lark submission may be complete; verify Scan History JSON "
+                    "and Lark before any further action."
+                )
+            else:
+                self._persist_workflow(
+                    "lark_pending", keep_restore=True, last_error=error_message,
+                )
+                self.set_status("Lark filing needs review; Odoo was not repeated.")
+        finally:
+            # Re-enable the retry button BEFORE the error dialog is shown.
+            self.set_processing_buttons(False)
+        if error_message:
+            messagebox.showerror(
+                "Lark Retry Error",
+                error_message +
+                "\n\nExisting Odoo work was not touched. Check whether "
+                "Lark partially submitted before attempting another retry.",
+            )
+
+    def _check_other_lark_filing(self):
+        """Avoid knowingly filing an order already completed on another scan ID."""
+        if not self.current_scan_id or not self.current_order_id:
+            raise RuntimeError("Missing scan identity; do not start Lark filing.")
+        for earlier in self.workflow_store.list_recent_scans(limit=None):
+            if (earlier.get("scan_id") != self.current_scan_id and
+                    earlier.get("platform") == self.current_platform and
+                    earlier.get("order_id") == self.current_order_id and
+                    (earlier.get("lark_results") or earlier.get("normal_lark_results") or
+                     earlier.get("wrong_item_lark_results"))):
+                raise RuntimeError(
+                    "Another scan of this marketplace order already has Lark "
+                    "submission results. Inspect History before filing; no new "
+                    "Lark form has been submitted."
+                )
+
+    def _run_lark_submit_step(self):
+        """Independently file and checkpoint normal vs Wrong Item / Scam routes."""
+        normal = [item for item in self.returned_products if not is_wrong_item(item)]
+        wrong_plans = plan_wrong_item_filings(
+            self.current_order_id, self.returned_products,
+        )  # preflight ALL wrong-item rows before opening any Lark form
+        # Cross-route financial preflight: TikTok may have normal and Wrong
+        # Item entries belonging to the same source return card. No guessed
+        # allocation is allowed for the normal Item Returns Lark Base.
+        normal_case = copy.deepcopy(self.return_case)
+        if normal and wrong_plans and self.current_platform != "TikTok":
+            # A mixed order cannot assign the entire order refund to only
+            # normal items. File the actual retained item amounts instead.
+            normal_case = normal_case or {}
+            normal_case["value_mode"] = "item_amounts"
+        if normal and wrong_plans and self.current_platform == "TikTok" and \
+                (normal_case or {}).get("value_mode") == "tiktok_return_groups":
+            normal_case["tiktok_manual_selection"] = confirm_tiktok_manual_selection(
+                normal_case, normal,
+                "Items routed separately to Wrong Item / Scam Lark Base",
+            )
+            normal_case.pop("tiktok_selection_pending", None)
+
+        self._check_other_lark_filing()
+        self._persist_lark_progress_strict()  # resume authority before first side effect
+        if normal:
+            self.set_status("Filing normal returns to Lark Item Returns...")
+            def on_normal_complete(result):
+                self.normal_lark_results.append(copy.deepcopy(result))
+                self._persist_lark_progress_strict()  # before next record
+            records = file_lark_returns(
+                context=self.browser.context,
+                order_id=self.current_order_id,
+                returned_products=normal,
+                return_case=normal_case,
+                case_decision=self.case_decision,
+                odoo_results=self.odoo_results,
+                progress_callback=self.set_status,
+                existing_results=self.normal_lark_results,
+                on_record_complete=on_normal_complete,
+            )
+            self.normal_lark_results = copy.deepcopy(records)
+            self._persist_lark_progress_strict()
+
+        filed_wrong = {v.get("route_key") for v in self.wrong_item_lark_results
+                       if v.get("submitted")}
+        for plan in wrong_plans:
+            if plan["route_key"] in filed_wrong:
+                continue
+            self.set_status(f"Filing Wrong Item / Scam: {plan['sku']}...")
+            self._persist_lark_progress_strict()
+            result = submit_wrong_item_plan(
+                self.browser.context, plan, progress_callback=self.set_status,
+            )
+            self.wrong_item_lark_results.append(result)
+            filed_wrong.add(plan["route_key"])
+            self._persist_lark_progress_strict()  # before next record
+
+        self.lark_results = (
+            copy.deepcopy(self.normal_lark_results) +
+            copy.deepcopy(self.wrong_item_lark_results)
         )
+        if not self.lark_results:
+            raise RuntimeError("No valid Lark filing records were generated.")
+        lines = [self.odoo_result_label.cget("text"), "",
+                 f"Lark submitted {len(self.lark_results)} total record(s)."]
+        for record in self.lark_results:
+            label = record.get("lark_base") or "Item Returns"
+            lines.append(f"{label} | {record.get('sku')} | "
+                         f"{record.get('status', '')} | "
+                         f"{record.get('transfer_id') or 'No Odoo transfer'}")
+        lines.append("SUBMISSION COMPLETE")
+        self.odoo_result_label.config(text="\n".join(lines))
+        self._persist_workflow("completed", keep_restore=False)
+        saved = self.workflow_store.get_scan(self.current_scan_id)
+        if (not saved or saved.get("workflow_state") != "completed" or
+                saved.get("lark_results") != self.lark_results):
+            raise RuntimeError(
+                "Lark forms were submitted, but Completed Scan History could "
+                "not be verified. Inspect Lark and Recovery before any retry."
+            )
+
     def submit_case(self):
         """
 
@@ -3304,6 +4686,21 @@ class ReturnProcessorApp(tk.Tk):
             )
             return
         returned_items = self.returned_items_for_odoo()
+        if returned_items and not self.odoo_results:
+            try:
+                other_case = self._find_saved_odoo_workflow()
+            except Exception as error:
+                messagebox.showerror(
+                    "Recovery Check Failed",
+                    f"Could not verify existing Odoo tickets in local JSON: {error}\n"
+                    "No new Helpdesk ticket was created.",
+                )
+                return
+            if other_case:
+                # Offer inspect / safe recovery first. A separate ticket can be
+                # created only with exact typed confirmation and durable audit.
+                if not self._resolve_saved_odoo_duplicate(other_case):
+                    return
         stage = "Odoo"
         try:
             self.set_processing_buttons(
@@ -3327,12 +4724,12 @@ class ReturnProcessorApp(tk.Tk):
             else:
                 self.odoo_results = None
                 self.transfer_id_label.config(
-                    text="No Odoo transfer (Not Returned)",
+                    text="No Odoo transfer (direct Lark filing)",
                 )
                 self.odoo_result_label.config(
                     text=(
-                        "Odoo skipped: all confirmed items are Not Returned.\n"
-                        "Filing directly to Lark..."
+                        "Odoo skipped: no inventory transfer required.\n"
+                        "Filing to the applicable Lark Base(s)..."
                     ),
                 )
                 self._persist_workflow(
@@ -3361,12 +4758,12 @@ class ReturnProcessorApp(tk.Tk):
             self.odoo_checkpoint = error.checkpoint
             self._render_odoo_checkpoint(str(error))
             self._persist_workflow(
-                "odoo_return_pending",
+                self._odoo_pause_state(self.odoo_checkpoint),
                 keep_restore=True,
                 last_error=str(error),
             )
             self.set_status(
-                "Odoo ticket saved; return is waiting for inventory validation."
+                "Odoo ticket saved; unfinished ticket setup/return is recoverable."
             )
             messagebox.showwarning(
                 "Odoo Return Pending",
@@ -3374,11 +4771,21 @@ class ReturnProcessorApp(tk.Tk):
             )
         except Exception as error:
             if stage == "Odoo":
-                self._persist_workflow(
-                    "odoo_error_manual_review",
-                    keep_restore=False,
-                    last_error=str(error),
-                )
+                if self.odoo_checkpoint:
+                    # A ticket may exist, or a TC/IN may have been created.
+                    # Never erase the restore point on an unexpected failure.
+                    self.odoo_checkpoint["resume_safe"] = False
+                    self.odoo_checkpoint["stage"] = "manual_review"
+                    self._render_odoo_checkpoint(str(error))
+                    self._persist_workflow(
+                        "manual_review", keep_restore=True,
+                        last_error=str(error),
+                    )
+                else:
+                    self._persist_workflow(
+                        "odoo_error_manual_review", keep_restore=False,
+                        last_error=str(error),
+                    )
                 self.set_status(
                     (
                         "Submit stopped: Odoo processing failed. "
@@ -3389,7 +4796,14 @@ class ReturnProcessorApp(tk.Tk):
                     text=(
                         "Odoo processing failed.\n"
                         f"{error}\n\n"
-                        "Lark was not filed."
+                        "Lark was not filed. "
+                        + (
+                            "Existing Odoo ticket/checkpoint preserved. "
+                            "Do not submit this order again; use Recovery "
+                            "and review Odoo first."
+                            if self.odoo_checkpoint else
+                            "No completed Odoo ticket was confirmed."
+                        )
                     ),
                 )
                 messagebox.showerror(
@@ -3399,16 +4813,19 @@ class ReturnProcessorApp(tk.Tk):
             else:
                 if returned_items and self.odoo_results:
                     retry_message = (
-                        "Odoo is already complete. Press Submit again "
-                        "to retry Lark only; Odoo will not run again."
+                        "Odoo is already complete. Use Retry Lark Only "
+                        "after closing this message; Odoo will not run again."
                     )
                 else:
                     retry_message = (
-                        "Press Submit again to retry the Lark filing."
+                        "Use Retry Lark Only to retry the Lark filing."
                     )
                 self.set_status(
                     "Lark filing failed. " + retry_message
                 )
+                # The retry action is not clickable while a modal is up if
+                # the processing-busy flag is still set. Reset it first.
+                self.set_processing_buttons(False)
                 messagebox.showerror(
                     "Lark Error",
                     f"{error}\n\n{retry_message}",
@@ -3484,6 +4901,9 @@ class ReturnProcessorApp(tk.Tk):
             ))
             if item.get("remarks"):
                 fields.append(f"Remarks: {item['remarks']}")
+            if is_wrong_item(item):
+                fields.append(f"Received Item: {item.get('received_item', '')}")
+                fields.append(f"Wrong Item / Scam Status: {item.get('wrong_item_status', '')}")
             source = item.get("source_data")
             if isinstance(source, dict):
                 if source.get("return_item_ids"):

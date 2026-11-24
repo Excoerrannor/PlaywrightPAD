@@ -80,81 +80,126 @@ def _result_identities(rows) -> list[dict]:
     return identities
 
 
-def _find_result_row(
+def _find_result_rows(
     page,
     query: str,
     search_by: str,
     *,
     previous_return_ids: set[str] | None = None,
     query_changed: bool = False,
-):
-    """
-    Wait for TikTok's filtered result and return the data row.
+) -> tuple[str, list[str]]:
+    """Return (marketplace order ID, return IDs) for the filtered results.
 
-    Order ID / Return Order ID can be verified directly from data-log_json.
-    Tracking Number is not rendered in the overview row, so the safe condition
-    is that TikTok has filtered the list to one distinct return order.
+    One marketplace order can have multiple independent TikTok return cards.
+    A tracking-number search must resolve to ONE parent order, but it may
+    legitimately contain multiple different reverse_main_order_id values.
+
+    The former 'one return ID' assumption rejected such orders as ambiguous.
+    The new version still fails closed if tracking results mix parent orders,
+    contain invalid identity fields, or remain unchanged from a different
+    previous tracking search (possible stale SPA result).
     """
     rows = page.locator(RESULT_DATA_ROW_SELECTOR)
-    deadline_ms = SEARCH_RESULT_TIMEOUT
     step_ms = 250
     elapsed = 0
+    stable_signature = None
+    stable_polls = 0
+    previous_return_ids = set(previous_return_ids or ())
 
-    while elapsed < deadline_ms:
-        count = rows.count()
-        if count:
-            identities = _result_identities(rows)
-
-            if search_by == "Order ID":
-                for identity in identities:
-                    if identity["order_id"] == query:
-                        return rows.nth(identity["index"])
-
-            elif search_by == "Return Order ID":
-                for identity in identities:
-                    if identity["return_order_id"] == query:
-                        return rows.nth(identity["index"])
-
+    while elapsed < SEARCH_RESULT_TIMEOUT:
+        identities = _result_identities(rows)
+        relevant = []
+        if identities and all(
+            item["order_id"] and item["return_order_id"]
+            for item in identities
+        ):
+            if search_by == "Return Order ID":
+                relevant = [
+                    item for item in identities
+                    if item["return_order_id"] == query
+                ]
+            elif search_by == "Order ID":
+                # An Order ID search may show multiple return cards, but never
+                # mix this order with unrelated orders in the same result.
+                if all(item["order_id"] == query for item in identities):
+                    relevant = identities
             else:
-                distinct = {
-                    item["return_order_id"]
-                    for item in identities
-                    if item["return_order_id"]
-                }
-                # One return order can have a header row + data row, but this
-                # selector only includes the data row. Requiring one distinct
-                # return order prevents loading an unfiltered list accidentally.
-                if len(distinct) == 1:
-                    # A different barcode must not reuse a previous one-result
-                    # row: that can file the wrong return. Fail closed.
-                    # barcode, do not accept the old single result while the
-                    # SPA is still refreshing.
-                    if (
-                        query_changed
-                        and previous_return_ids
-                        and distinct == previous_return_ids
-                                            ):
-                        page.wait_for_timeout(step_ms)
-                        elapsed += step_ms
-                        continue
+                # The tracking number is not shown on overview rows. Accept
+                # the filtered set only if ALL visible returns belong to one
+                # parent order and TikTok has replaced an earlier query's set.
+                parent_orders = {item["order_id"] for item in identities}
+                if len(parent_orders) == 1:
+                    relevant = identities
 
-                    target = next(iter(distinct))
-                    for identity in identities:
-                        if identity["return_order_id"] == target:
-                            return rows.nth(identity["index"])
+        if relevant:
+            order_ids = {item["order_id"] for item in relevant}
+            distinct_return_ids = list(dict.fromkeys(
+                item["return_order_id"] for item in relevant
+            ))
+            # When the operator changes the tracking barcode, do not silently
+            # reuse an identical old set of return cards before React refreshes.
+            if (
+                search_by == "Tracking Number"
+                and query_changed
+                and previous_return_ids
+                and set(distinct_return_ids) == previous_return_ids
+            ):
+                stable_signature = None
+                stable_polls = 0
+            elif len(order_ids) == 1 and distinct_return_ids:
+                signature = (next(iter(order_ids)), tuple(distinct_return_ids))
+                if signature == stable_signature:
+                    stable_polls += 1
+                else:
+                    stable_signature = signature
+                    stable_polls = 1
+                # Require a briefly stable complete list; the SPA can update
+                # card rows incrementally after Enter. This is a DOM signal,
+                # not proof that tracking is printed in the overview.
+                if stable_polls >= 4:
+                    return signature[0], list(signature[1])
+        else:
+            stable_signature = None
+            stable_polls = 0
 
         page.wait_for_timeout(step_ms)
         elapsed += step_ms
 
     if search_by == "Tracking Number":
         raise ValueError(
-            "TikTok did not produce a new, unambiguous return after pressing Enter to "
-            f"Search for Tracking Number {query}. If a previous result remains "
-            "on screen, do not process it; retry the scan or search by Order ID."
+            "TikTok did not produce a verified, single-order result after "
+            f"searching tracking number {query}. Multiple return cards for "
+            "ONE Order ID are supported, but results from different orders "
+            "or unchanged previous-search results are not safe to file. "
+            "Retry the scan or search using the marketplace Order ID."
         )
-    raise ValueError(
-        f"TikTok return was not found for {search_by}: {query}."
-    )
+    raise ValueError(f"TikTok return was not found for {search_by}: {query}.")
+
+
+def _find_result_row_by_id(page, order_id: str, return_order_id: str):
+    """Reacquire a card after TikTok re-renders rows/popovers."""
+    rows = page.locator(RESULT_DATA_ROW_SELECTOR)
+    candidates = []
+    for index in range(rows.count()):
+        row = rows.nth(index)
+        try:
+            if not row.is_visible():
+                continue
+        except Exception:
+            continue
+        meta = _row_meta(row)
+        if (
+            _text(meta.get("main_order_id")) == order_id
+            and _text(meta.get("reverse_main_order_id")) == return_order_id
+        ):
+            candidates.append(row)
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected one TikTok details row for return {return_order_id} "
+            f"in order {order_id}, found {len(candidates)}. "
+            "TikTok results may have changed; rescan before submitting."
+        )
+    return candidates[0]
 
 
 def _extract_row_data(row) -> dict:
@@ -397,63 +442,116 @@ def get_tiktok_return_order(
     print(f"TIKTOK SEARCH: Enter sent for {search_by} {query}.")
     # Allow TikTok to dispatch the query before inspecting asynchronous rows.
     page.wait_for_timeout(500)
-    row = _find_result_row(
+    order_id, return_ids = _find_result_rows(
         page,
         query,
         search_by,
         previous_return_ids=previous_return_ids,
         query_changed=(previous_query != query),
     )
-    row.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
-
-    data = _extract_row_data(row)
-    order_id = _text(data.get("order_id"))
-    return_order_id = _text(data.get("return_order_id"))
-    if not order_id:
-        raise ValueError("TikTok search result has no Order ID.")
-    if not return_order_id:
-        raise ValueError("TikTok search result has no Return Order ID.")
-
+    if not order_id or not return_ids:
+        raise ValueError("TikTok returned no verifiable marketplace order and return IDs.")
     if search_by == "Order ID" and order_id != query:
-        raise ValueError(
-            f"Wrong TikTok order found. Expected {query}, got {order_id}."
-        )
-    if search_by == "Return Order ID" and return_order_id != query:
-        raise ValueError(
-            "Wrong TikTok return order found. "
-            f"Expected {query}, got {return_order_id}."
-        )
+        raise ValueError(f"Wrong TikTok order found. Expected {query}, got {order_id}.")
+    if search_by == "Return Order ID" and return_ids != [query]:
+        raise ValueError(f"Wrong TikTok Return Order ID found for {query}.")
 
-    popover = _open_product_details(page, row)
-    products = _extract_products_from_popover(popover)
-    if not products:
-        raise ValueError(
-            "TikTok return was found, but Seller SKU / QTY could not be read "
-            "from the product details popover."
-        )
-
-    count_match = re.search(r"(\d+)", _text(data.get("item_count_text")))
-    if count_match:
-        expected_item_count = int(count_match.group(1))
-        actual_total_qty = sum(
-            max(int(product.get("quantity") or 1), 1)
-            for product in products
-        )
-        if expected_item_count != actual_total_qty:
-            raise ValueError(
-                "TikTok product quantity did not match the return row. "
-                f"Row shows {expected_item_count} item(s), popover quantity "
-                f"totals {actual_total_qty}. Retry the scan before submitting."
+    returns = []
+    all_products = []
+    for return_id in return_ids:
+        # Independent return cards can share the same parent order. Never use
+        # a cached row object after clicking another product popover.
+        row = _find_result_row_by_id(page, order_id, return_id)
+        row.wait_for(state="visible", timeout=DEFAULT_TIMEOUT)
+        result = _extract_row_data(row)
+        if (
+            _text(result.get("order_id")) != order_id
+            or _text(result.get("return_order_id")) != return_id
+        ):
+            raise RuntimeError(
+                f"TikTok return {return_id} changed while reading. "
+                "Rescan before submitting."
             )
 
-    data["items"] = products
-    data["platform"] = "TikTok"
-    data["tracking_number"] = query if search_by == "Tracking Number" else ""
-    data["search_query"] = query
-    data["search_by"] = search_by
-    data["return_url"] = page.url
-    data["value_source"] = "TikTok return Refund total"
-    return data
+        if not _text(result.get("refund_text")):
+            raise ValueError(
+                f"TikTok return {return_id} has no visible refund amount. "
+                "Do not file a return with unknown financial values."
+            )
+
+        popover = _open_product_details(page, row)
+        products = _extract_products_from_popover(popover)
+        if not products:
+            raise ValueError(
+                f"TikTok return {return_id} has no readable Seller SKU/QTY "
+                "in the product popover. The scan was not loaded."
+            )
+
+        count_match = re.search(r"(\d+)", _text(result.get("item_count_text")))
+        if not count_match:
+            raise ValueError(
+                f"TikTok return {return_id} lacks a visible item count. "
+                "Cannot safely load a partial return."
+            )
+        expected_item_count = int(count_match.group(1))
+        actual_total_qty = sum(int(product["quantity"]) for product in products)
+        # Different TikTok views/locales can label "items" as the number
+        # of product lines or as the sum of their QTY. Accept either *only*
+        # after every Seller SKU line and its own positive QTY were read.
+        if expected_item_count not in (actual_total_qty, len(products)):
+            raise ValueError(
+                f"TikTok return {return_id} shows {expected_item_count} item(s), "
+                f"but the product popover has {len(products)} SKU row(s) "
+                f"and {actual_total_qty} total unit(s). "
+                "No partial scan was saved."
+            )
+
+        # All cards must be read and validated before returning anything to
+        # main.py; a failure on one card must not produce a partial scan.
+        for product in products:
+            entry = dict(product)
+            entry.update({
+                "return_order_id": return_id,
+                "return_group_quantity": actual_total_qty,
+                "return_group_item_rows": len(products),
+                "return_group_refund_value": result["refund_value"],
+                "return_group_refund_text": result["refund_text"],
+                "return_reason": result.get("return_reason", ""),
+                "source_status": result.get("source_status", ""),
+                "logistics_status": result.get("logistics_status", ""),
+                "logistics_time": result.get("logistics_time", ""),
+                "paid_text": result.get("paid_text", ""),
+            })
+            all_products.append(entry)
+        result["items"] = products
+        result["source_item_count"] = actual_total_qty
+        returns.append(result)
+
+    total = round(sum(row["refund_value"] for row in returns), 2)
+    # No repeated Paid amounts are added: refund_value is the SUM of the
+    # separate return cards' refund amounts.
+    summary = dict(returns[0])
+    summary.update({
+        "order_id": order_id,
+        "return_order_id": return_ids[0] if len(return_ids) == 1 else "",
+        "return_order_ids": return_ids,
+        "return_count": len(return_ids),
+        "returns": returns,
+        "refund_value": total,
+        "refund_text": f"₱{total:,.2f}",
+        "items": all_products,
+        "source_item_count": sum(row["source_item_count"] for row in returns),
+        "platform": "TikTok",
+        "tracking_number": query if search_by == "Tracking Number" else "",
+        "search_query": query,
+        "search_by": search_by,
+        "return_url": page.url,
+        "value_source": (
+            "Sum of TikTok return-card refund totals"
+            if len(returns) > 1 else "TikTok return Refund total"
+        ),
+    })
+    return summary
 
 
 def get_tiktok_return_by_tracking(page, tracking_number: str) -> dict:

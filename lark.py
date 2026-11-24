@@ -1,4 +1,8 @@
+import hashlib
+import json
+import math
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote, urlencode
 
 LARK_FORM_BASE_URL = (
@@ -124,7 +128,7 @@ def _wait_for_form_ready(page):
         if "login" in live_url.lower() or "sign in" in body_text.lower():
             raise RuntimeError(
                 "Lark is asking for login. Sign in to Lark in the processor "
-                "Chrome window, then press Submit again."
+                "Chrome window, then use Retry Lark Only."
             ) from error
         raise RuntimeError(
             "The Lark Item Returns form did not become ready."
@@ -500,7 +504,158 @@ def _refund_value(return_case: dict | None) -> float:
 def _value_source(return_case: dict | None) -> str:
     if not return_case:
         return "Return/refund value"
+    if (return_case.get("tiktok_manual_selection") or {}).get("mode") == "operator_curated":
+        return "Operator-confirmed selected TikTok item refunds"
     return _text(return_case.get("value_source")) or "Return/refund value"
+
+
+def _tiktok_selection_rows(items: list[dict]) -> list[dict]:
+    """Canonical selected source rows; changing any Lark-critical field voids approval."""
+    rows = []
+    for item in items:
+        src = item.get("source_data") or {}
+        if not isinstance(src, dict):
+            src = {}
+        rows.append({
+            "return_order_id": _text(src.get("return_order_id")),
+            "sku": _text(item.get("sku")).upper(),
+            "quantity": item.get("quantity"),
+            "amount": item.get("amount"),
+            "classification": _text(item.get("classification")),
+            "decision": _text(item.get("decision")),
+            "status": _text(item.get("status")),
+            "grade": _text(item.get("grade")),
+            "odoo_tag": _text(item.get("odoo_tag")),
+        })
+    return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
+
+
+def _tiktok_selection_fingerprint(items: list[dict]) -> str:
+    encoded = json.dumps(_tiktok_selection_rows(items), sort_keys=True,
+                         separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tiktok_source_fingerprint(case: dict) -> str:
+    encoded = json.dumps({
+        "order_id": _text(case.get("order_id")),
+        "return_group_totals": case.get("return_group_totals"),
+        "return_group_quantities": case.get("return_group_quantities"),
+    }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def preview_tiktok_manual_selection(return_case: dict, items: list[dict]) -> dict:
+    """Safely preview an operator-curated *subset* of an original TikTok scan.
+
+    Source return cards stay immutable. Every retained row requires its own
+    explicitly assigned total refund amount; no original card's whole amount
+    is implicitly copied to a partial set of SKUs. This never touches Odoo.
+    """
+    case = return_case or {}
+    if _text(case.get("value_mode")) != "tiktok_return_groups":
+        raise ValueError("Manual TikTok selection applies to multi-return scans only.")
+    totals = case.get("return_group_totals") or {}
+    quantities = case.get("return_group_quantities") or {}
+    if not isinstance(totals, dict) or not isinstance(quantities, dict) or not totals or set(totals) != set(quantities):
+        raise ValueError("Original TikTok return-card totals or quantities are unavailable.")
+    if not items:
+        raise ValueError("At least one item must remain for Lark filing.")
+    selected_qty = {}
+    selected_amounts = {}
+    for item in items:
+        source = item.get("source_data") or {}
+        rid = _text(source.get("return_order_id") if isinstance(source, dict) else "")
+        sku = _text(item.get("sku")).upper()
+        if not rid or rid not in totals or rid not in quantities:
+            raise ValueError(f"SKU {sku or '?'} has an unknown TikTok Return Order ID; do not bypass reconciliation.")
+        if not sku:
+            raise ValueError("Every retained TikTok item must have a SKU.")
+        try:
+            qty = int(item.get("quantity"))
+            if qty <= 0 or float(item.get("quantity")) != qty:
+                raise ValueError()
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"SKU {sku} must have a positive, whole-number QTY.") from exc
+        raw_amount = item.get("amount")
+        if raw_amount is None or str(raw_amount).strip() == "":
+            raise ValueError(
+                f"SKU {sku} (return {rid}) needs its verified, manually entered "
+                "refund Amount before an edited TikTok selection can be filed."
+            )
+        try:
+            amount = float(raw_amount)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"SKU {sku} has an invalid refund Amount.") from exc
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError(f"SKU {sku} must have a finite, nonnegative refund Amount.")
+        selected_qty[rid] = selected_qty.get(rid, 0) + qty
+        selected_amounts[rid] = selected_amounts.get(rid, 0.0) + amount
+
+    for rid, qty in selected_qty.items():
+        try:
+            source_qty = int(quantities[rid])
+            source_amount = float(totals[rid])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Original TikTok values are invalid for {rid}.") from exc
+        if source_qty <= 0 or not math.isfinite(source_amount) or source_amount < 0:
+            raise ValueError(f"Original TikTok values are invalid for {rid}.")
+        if qty > source_qty:
+            raise ValueError(f"Return {rid} has {qty} selected unit(s), above the original {source_qty}.")
+        if round(selected_amounts[rid], 2) > round(source_amount, 2) + 0.01:
+            raise ValueError(
+                f"Return {rid} selected amount PHP {selected_amounts[rid]:,.2f} "
+                f"exceeds original TikTok refund PHP {source_amount:,.2f}."
+            )
+
+    return {
+        "source_return_count": len(totals),
+        "selected_return_count": len(selected_qty),
+        "source_units": sum(int(q) for q in quantities.values()),
+        "selected_units": sum(selected_qty.values()),
+        "source_refund": round(sum(float(v) for v in totals.values()), 2),
+        "selected_refund": round(sum(selected_amounts.values()), 2),
+        "excluded_return_ids": sorted(set(totals) - set(selected_qty)),
+        "selected_return_quantities": dict(sorted(selected_qty.items())),
+        "selected_return_amounts": {rid: round(val, 2) for rid, val in sorted(selected_amounts.items())},
+    }
+
+
+def confirm_tiktok_manual_selection(return_case: dict, items: list[dict], reason: str) -> dict:
+    """Create durable audit evidence of the user's explicitly curated subset."""
+    reason = _text(reason)
+    if len(reason) < 5:
+        raise ValueError("Provide a reason (at least five characters) for the edited selection.")
+    summary = preview_tiktok_manual_selection(return_case, items)
+    return {
+        "mode": "operator_curated",
+        "reason": reason,
+        "confirmed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "order_id": _text((return_case or {}).get("order_id")),
+        "source_fingerprint": _tiktok_source_fingerprint(return_case),
+        "selection_fingerprint": _tiktok_selection_fingerprint(items),
+        **summary,
+    }
+
+
+def _confirmed_tiktok_manual_selection(return_case: dict | None, items: list[dict]) -> bool:
+    case = return_case or {}
+    approved = case.get("tiktok_manual_selection") or {}
+    if not isinstance(approved, dict) or approved.get("mode") != "operator_curated":
+        return False
+    if _text(approved.get("order_id")) != _text(case.get("order_id")):
+        raise ValueError("TikTok selection approval belongs to another Order ID.")
+    if approved.get("source_fingerprint") != _tiktok_source_fingerprint(case):
+        raise ValueError("TikTok source metadata changed after manual selection approval.")
+    if approved.get("selection_fingerprint") != _tiktok_selection_fingerprint(items):
+        raise ValueError(
+            "TikTok selected items changed after manual approval. "
+            "Reconfirm the selection before Lark filing."
+        )
+    if case.get("tiktok_selection_pending"):
+        raise ValueError("TikTok edits have not been reconfirmed for Lark filing.")
+    preview_tiktok_manual_selection(case, items)
+    return True
 
 
 def _record_value(return_case: dict | None, items: list[dict]) -> float:
@@ -509,6 +664,79 @@ def _record_value(return_case: dict | None, items: list[dict]) -> float:
     Lazada can opt into item-level values by setting value_mode=item_amounts.
     """
     default_value = _refund_value(return_case)
+    if _text((return_case or {}).get("value_mode")) == "tiktok_return_groups":
+        # Operator-curated items use explicitly entered *row* refund amounts;
+        # never apply a full source card's refund to a partial selection.
+        if ((return_case or {}).get("tiktok_manual_selection") or {}).get("mode") == "operator_curated":
+            subtotal = 0.0
+            for item in items:
+                raw = item.get("amount")
+                try:
+                    value = float(raw)
+                    quantity = int(item["quantity"])
+                    source_qty = int(item.get("_lark_source_quantity") or quantity)
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise ValueError("Edited TikTok item has invalid amount or quantity.") from exc
+                if not math.isfinite(value) or value < 0 or source_qty <= 0 or quantity <= 0 or quantity > source_qty:
+                    raise ValueError("Edited TikTok item has invalid amount or quantity.")
+                subtotal += value * quantity / source_qty
+            return round(subtotal, 2)
+        # One marketplace Order ID can have multiple return requests, each
+        # with its own refund amount. Never repeat the full order refund for
+        # every Odoo transfer/Lark entry, and never divide a refund across
+        # individual products without verified source amounts.
+        totals = (return_case or {}).get("return_group_totals") or {}
+        quantities = (return_case or {}).get("return_group_quantities") or {}
+        groups = {}
+        for item in items:
+            source = item.get("source_data") or {}
+            rid = _text(source.get("return_order_id"))
+            if not rid or rid not in totals or rid not in quantities:
+                raise ValueError(
+                    "A TikTok item lacks a verified Return Order ID or return-card "
+                    "refund total. Restore the original scan before Lark filing."
+                )
+            groups.setdefault(rid, []).append(item)
+
+        group_total = 0.0
+        for rid, group_items in groups.items():
+            actual_qty = sum(int(item.get("quantity") or 0) for item in group_items)
+            expected_qty = int(quantities[rid])
+            if actual_qty == expected_qty:
+                # All units of this return request belong to this one Lark
+                # filing, so the return-card's real refund can be used.
+                group_total += float(totals[rid])
+                continue
+            if actual_qty > expected_qty:
+                raise ValueError(
+                    f"TikTok return {rid} has {actual_qty} selected unit(s), "
+                    f"but the return card has only {expected_qty}."
+                )
+            # Only part of one return request is in this Lark record. Require
+            # manually entered SKU amounts, never guess an allocation.
+            subtotal = 0.0
+            for item in group_items:
+                raw = item.get("amount")
+                if raw is None or str(raw).strip() == "":
+                    raise ValueError(
+                        f"TikTok return {rid} is split across multiple Lark "
+                        "records. Enter the correct refund Amount for each "
+                        "SKU in this return before filing; the card's total "
+                        "cannot be attributed to individual SKUs safely."
+                    )
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Invalid TikTok item Amount for {item.get('sku')}."
+                    ) from error
+                if value < 0:
+                    raise ValueError("TikTok item Amount cannot be negative.")
+                source_qty = int(item.get("_lark_source_quantity") or item["quantity"])
+                subtotal += value * int(item["quantity"]) / source_qty
+            group_total += subtotal
+        return round(group_total, 2)
+
     if _text((return_case or {}).get("value_mode")) != "item_amounts":
         return default_value
 
@@ -523,6 +751,165 @@ def _record_value(return_case: dict | None, items: list[dict]) -> float:
             raise ValueError(f"Return amount for {sku or 'item'} cannot be negative.")
         total += amount
     return round(total, 2)
+
+def verify_tiktok_source_coverage(return_case: dict | None,
+                                  items: list[dict]) -> None:
+    """Verify *all* TikTok return-card IDs/units before Odoo or Lark.
+
+    A marketplace order can contain several independent return cards. The
+    order-level refund must not be assigned to only one of those cards. This
+    runs at scan confirmation as well as immediately before Lark filing, so
+    partial or legacy saved scans cannot create misleading financial data.
+    """
+    if _text((return_case or {}).get("value_mode")) != "tiktok_return_groups":
+        return
+    if _confirmed_tiktok_manual_selection(return_case, items):
+        return  # audited, valid subset; Odoo-to-items match checked separately
+    if (return_case or {}).get("tiktok_selection_pending"):
+        raise ValueError(
+            "TikTok items were manually edited. Confirm the selected source "
+            "items and their refund amounts before Odoo/Lark filing."
+        )
+    totals = (return_case or {}).get("return_group_totals") or {}
+    quantities = (return_case or {}).get("return_group_quantities") or {}
+    if not totals or not quantities or set(totals) != set(quantities):
+        raise ValueError(
+            "TikTok saved return-card metadata is incomplete. Rescan the order; "
+            "if Odoo has already been processed, do not create another ticket."
+        )
+    actual = {}
+    for item in items:
+        source = item.get("source_data") or {}
+        rid = _text(source.get("return_order_id"))
+        if not rid:
+            raise ValueError(
+                f"TikTok SKU {_text(item.get('sku')) or '?'} has no Return Order ID. "
+                "This scan must be reconciled before Lark filing."
+            )
+        try:
+            qty = int(item.get("quantity") or 0)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"TikTok SKU {_text(item.get('sku'))} has invalid QTY.") from exc
+        if qty <= 0:
+            raise ValueError(f"TikTok SKU {_text(item.get('sku'))} has invalid QTY {qty}.")
+        actual[rid] = actual.get(rid, 0) + qty
+    expected_ids = set(quantities)
+    actual_ids = set(actual)
+    missing = sorted(expected_ids - actual_ids)
+    extra = sorted(actual_ids - expected_ids)
+    quantities_wrong = [
+        f"{rid}: saved {actual[rid]}, TikTok {int(quantities[rid])}"
+        for rid in sorted(expected_ids & actual_ids)
+        if actual[rid] != int(quantities[rid])
+    ]
+    if missing or extra or quantities_wrong:
+        details = []
+        if missing:
+            details.append("Missing return-card ID(s): " + ", ".join(missing))
+        if extra:
+            details.append("Unexpected return-card ID(s): " + ", ".join(extra))
+        if quantities_wrong:
+            details.append("Quantity mismatch: " + "; ".join(quantities_wrong))
+        details.append(
+            f"Loaded {sum(actual.values())} of "
+            f"{sum(int(q) for q in quantities.values())} expected unit(s)."
+        )
+        raise ValueError(
+            "TikTok multi-return scan does not cover all saved return cards. "
+            + " | ".join(details)
+            + " Correct/reconcile the saved source items before Lark filing. "
+            "If Odoo has already completed, do NOT submit to Odoo again."
+        )
+
+
+def _preflight_tiktok_return_groups(
+    return_case: dict | None,
+    physically_returned: list[dict],
+    not_returned: list[dict],
+    transfers: list[dict],
+) -> None:
+    """Verify that TikTok per-return refunds will not be duplicated in Lark.
+
+    Run BEFORE filing any record. If one TikTok return card is split across
+    different Odoo transfers (or direct Not Returned items), require manual
+    SKU allocations that sum back to the verified refund for that card.
+    """
+    if _text((return_case or {}).get("value_mode")) != "tiktok_return_groups":
+        return
+    verify_tiktok_source_coverage(return_case, physically_returned + not_returned)
+    totals = return_case.get("return_group_totals") or {}
+    expected_qtys = return_case.get("return_group_quantities") or {}
+    curated = _confirmed_tiktok_manual_selection(
+        return_case, physically_returned + not_returned,
+    )
+    assignments = {}
+    pool = _build_returned_item_pool(physically_returned)
+    for ix, transfer in enumerate(transfers, start=1):
+        for item in _take_items_for_transfer(transfer, pool):
+            rid = _text((item.get("source_data") or {}).get("return_order_id"))
+            assignments.setdefault(rid, []).append((f"transfer:{ix}", item))
+    if any(entry["remaining"] for entry in pool):
+        raise ValueError(
+            "Some physically returned TikTok items are not represented in "
+            "the recorded Odoo transfer(s). Lark filing is blocked."
+        )
+    for ix, item in enumerate(not_returned, start=1):
+        rid = _text((item.get("source_data") or {}).get("return_order_id"))
+        assignments.setdefault(rid, []).append((f"direct:{ix}", item))
+
+    expected_selected = (
+        return_case["tiktok_manual_selection"]["selected_return_quantities"]
+        if curated else expected_qtys
+    )
+    if set(assignments) != set(expected_selected):
+        raise ValueError(
+            "TikTok Lark transfers do not cover the confirmed selected return "
+            "cards. Review the existing Odoo transfer(s) and item list."
+        )
+    for rid, entries in assignments.items():
+        actual = sum(int(item.get("quantity") or 0) for _, item in entries)
+        expected = int(expected_selected[rid])
+        if actual != expected:
+            raise ValueError(
+                f"TikTok return {rid} has {actual} item unit(s) allocated to "
+                f"Lark, but the confirmed selection has {expected}."
+            )
+        filings = {key for key, _ in entries}
+        if curated:
+            # The operator has already confirmed each retained item's
+            # refund. Values may be lower than the original return-card total.
+            subtotal = 0.0
+            for _, item in entries:
+                q = int(item["quantity"])
+                source_q = int(item.get("_lark_source_quantity") or q)
+                subtotal += float(item["amount"]) * q / source_q
+            if round(subtotal, 2) > round(float(totals[rid]), 2) + 0.01:
+                raise ValueError(f"Selected refund exceeds source return {rid}.")
+            continue
+        if len(filings) <= 1:
+            continue
+        subtotal = 0.0
+        for _, item in entries:
+            raw = item.get("amount")
+            if raw is None or str(raw).strip() == "":
+                raise ValueError(
+                    f"TikTok return {rid} is split across {len(filings)} "
+                    "Lark filings. Enter an accurate Amount for every "
+                    "SKU in that return card before submitting."
+                )
+            try:
+                amount = float(raw)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid Amount for SKU {item.get('sku')}.") from error
+            source_qty = int(item.get("_lark_source_quantity") or item["quantity"])
+            subtotal += amount * int(item["quantity"]) / source_qty
+        if abs(round(subtotal, 2) - round(float(totals[rid]), 2)) > 0.01:
+            raise ValueError(
+                f"TikTok return {rid} is allocated ₱{subtotal:,.2f} across "
+                f"multiple filings, but the source refund is "
+                f"₱{float(totals[rid]):,.2f}. Correct per-item Amounts first."
+            )
+
 
 def _build_returned_item_pool(items: list[dict]) -> list[dict]:
     pool = []
@@ -583,6 +970,7 @@ def _take_items_for_transfer(
             allocated = min(entry["remaining"], needed)
             allocated_item = dict(item)
             allocated_item["quantity"] = allocated
+            allocated_item["_lark_source_quantity"] = int(item["quantity"])
             matched.append(allocated_item)
 
             entry["remaining"] -= allocated
@@ -759,6 +1147,8 @@ def file_lark_returns(
     case_decision: dict | None,
     odoo_results: dict | None,
     progress_callback=None,
+    existing_results=None,
+    on_record_complete=None,
 ) -> list[dict]:
     """
     Returned items -> one Lark filing per Odoo Transfer ID.
@@ -785,7 +1175,25 @@ def file_lark_returns(
         )
 
     transfers = odoo_results.get("returns", []) if odoo_results else []
-    pool = _build_returned_item_pool(physically_returned)
+    _preflight_tiktok_return_groups(
+        return_case, physically_returned, not_returned, transfers,
+    )
+    # Prebuild and validate EVERY Lark record before clicking Submit on any
+    # one of them. An invalid later record must not leave an earlier filing
+    # submitted while the case appears to have failed validation.
+    planned_records = []
+    planning_pool = _build_returned_item_pool(physically_returned)
+    for index, transfer in enumerate(transfers, start=1):
+        planned_records.append(_transfer_record(
+            transfer, planning_pool, return_case, index,
+        ))
+    for item in not_returned:
+        planned_records.append(_direct_record(item, return_case))
+    if any(entry['remaining'] for entry in planning_pool):
+        raise ValueError(
+            'Some returned units have no matching Odoo transfer. '
+            'Lark was not opened; do not repeat Odoo.'
+        )
 
     results = []
     previous_success_page = None
@@ -806,23 +1214,30 @@ def file_lark_returns(
         previous_success_page = page
         return result
 
-    for index, transfer in enumerate(transfers, start=1):
-        record = _transfer_record(transfer, pool, return_case, index)
+    # Route key includes the intended form contents and position; previously
+    # confirmed records cannot be silently submitted again on a partial retry.
+    prior = {str(r.get("route_key")): r for r in (existing_results or [])
+             if r.get("route_key") and r.get("submitted")}
+    for index, record in enumerate(planned_records, start=1):
+        canonical = json.dumps({"order_id": order_id, "index": index,
+                                "record": record}, sort_keys=True, default=str)
+        route_key = "normal:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        previous = prior.get(route_key)
+        if previous:
+            _progress(progress_callback, f"Skipping previously filed {record['sku']}.")
+            results.append(previous)
+            continue
         _progress(
             progress_callback,
-            f"Filing Lark Transfer {index}/{len(transfers)}: "
-            f"{record['transfer_id']} | {record['sku']}",
+            f"Filing Lark record {index}/{len(planned_records)}: "
+            f"{record.get('transfer_id') or 'Direct'} | {record['sku']}",
         )
-        results.append(file_in_fresh_tab(record))
-
-    for index, item in enumerate(not_returned, start=1):
-        record = _direct_record(item, return_case)
-        _progress(
-            progress_callback,
-            f"Filing direct Lark item {index}/{len(not_returned)}: "
-            f"{record['sku']} | {record['status']}",
-        )
-        results.append(file_in_fresh_tab(record))
+        result = file_in_fresh_tab(record)
+        result["route_key"] = route_key
+        # Callback saves an atomic, verified Recovery point before another form.
+        if on_record_complete:
+            on_record_complete(result)
+        results.append(result)
 
     if not results:
         raise ValueError("No Lark filing records were generated.")
@@ -830,6 +1245,8 @@ def file_lark_returns(
 
 
 __all__ = [
+    "preview_tiktok_manual_selection",
+    "confirm_tiktok_manual_selection",
     "build_prefilled_lark_url",
     "get_or_open_lark_page",
     "file_lark_return",

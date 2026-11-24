@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "restore_points": {
+    "7a9e72e42a3649debdd164fd5d2a7f38": {
+      "scan_id": "7a9e72e42a3649debdd164fd5d2a7f38",
+      "created_at": "2026-11-17T16:11:58+08:00",
+      "updated_at": "2026-11-17T16:12:52+08:00",
+      "workflow_state": "odoo_return_pending",
+      "platform": "Shopee",
+      "search_by": "Tracking Number",
+      "search_input": "PH264200750050S",
+      "order_id": "2611137E4CT4BH",
+      "return_case": {
+        "order_id": "2611137E4CT4BH",
+        "request_id": "2611140A3J4DFCE",
+        "refund_text": "₱818.00",
+        "refund_value": 818.0,
+        "tracking_number": "PH264200750050S",
+        "tracking_numbers": [
+          "PH264200750050S"
+        ],
+        "source_href": "/portal/sale/return/248347427224974",
+        "source_url": "https://seller.shopee.ph/portal/sale/return/248347427224974",
+        "order_href": "",
+        "order_url": "",
+        "return_href": "/portal/sale/return/248347427224974",
+        "return_url": "https://seller.shopee.ph/portal/sale/return/248347427224974",
+        "product_names": [
+          "Makerlab ESP32 Basic Starter Kit WiFi IOT Development Learning Kit with PDF Projects and Code"
+        ],
+        "search_query": "PH264200750050S",
+        "search_by": "Tracking Number",
+        "platform": "Shopee"
+      },
+      "items": [
+        {
+          "sku": "MLE04758",
+          "quantity": 1,
+          "unit_price": 909,
+          "amount": 909.0,
+          "classification": "Defective",
+          "odoo_tag": "Damaged / Defective Item",
+          "decision": "Refunded",
+          "status": "Returned",
+          "platform": "Shopee",
+          "grade": "",
+          "remarks": "No damge not working"
+        }
+      ],
+      "case_decision": {
+        "confirmed": true
+      },
+      "new_stock_destination": "MNL/Stock",
+      "odoo_results": null,
+      "odoo_checkpoint": {
+        "order_id": "2611137E4CT4BH",
+        "ticket_title": "2611137E4CT4BH - MLE04758_1",
+        "ticket_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3742",
+        "product_sku": "MLE04758",
+        "tags": [
+          "Damaged / Defective Item"
+        ],
+        "platform": "Shopee",
+        "new_stock_destination": "MNL/Stock",
+        "customer": "ECOMMERCE, SHOPEE",
+        "returns": [],
+        "next_return_index": 1,
+        "resume_safe": true,
+        "setup_complete": true,
+        "stage": "inventory_pending",
+        "pending_return": {
+          "validation_boundary_version": 2,
+          "return_index": 1,
+          "decision": "Refunded",
+          "classification": "Defective",
+          "status": "Returned",
+          "items": [
+            {
+              "sku": "MLE04758",
+              "quantity": 1
+            }
+          ]
+        }
+      },
+      "lark_results": [],
+      "transfer_display": "Return pending - ticket saved",
+      "status_text": "Creating Return #1: MLE04758_1 | Defective | Refunded",
+      "last_error": "Sales Order 2611137E4CT4BH could not be selected from Odoo's suggestions (it may show 'No Record'). No stock Return was created.\n\nOdoo Helpdesk ticket already saved: 2611137E4CT4BH - MLE04758_1\nCheck the Sales Order suggestion and Odoo's Return/More action. Delivery to Return may be blank. Once ready, click Retry Odoo Return & Continue. The existing Helpdesk ticket will be reused."
+    },
+    "7b929f3e849d4cfc8117643c550740af": {
+      "scan_id": "7b929f3e849d4cfc8117643c550740af",
+      "created_at": "2026-11-18T17:16:43+08:00",
+      "updated_at": "2026-11-18T17:17:39+08:00",
+      "workflow_state": "odoo_return_pending",
+      "platform": "Shopee",
+      "search_by": "Tracking Number",
+      "search_input": "PH265302817034O",
+      "order_id": "261108PBKMAX0V",
+      "return_case": {
+        "order_id": "261108PBKMAX0V",
+        "request_id": "26111205KY8V6F3",
+        "refund_text": "₱469.00",
+        "refund_value": 469.0,
+        "tracking_number": "PH265302817034O",
+        "tracking_numbers": [
+          "PH265302817034O"
+        ],
+        "source_href": "/portal/sale/return/248193249286627",
+        "source_url": "https://seller.shopee.ph/portal/sale/return/248193249286627",
+        "order_href": "",
+        "order_url": "",
+        "return_href": "/portal/sale/return/248193249286627",
+        "return_url": "https://seller.shopee.ph/portal/sale/return/248193249286627",
+        "product_names": [
+          "Thermoelectric TEC12706 TEC-12706 Peltier Cooling System Heatsink Kit Air Cooled & Liquid Cooled"
+        ],
+        "search_query": "PH265302817034O",
+        "search_by": "Tracking Number",
+        "platform": "Shopee"
+      },
+      "items": [
+        {
+          "sku": "MLE00170",
+          "quantity": 1,
+          "unit_price": 469,
+          "amount": 469.0,
+          "classification": "Defective",
+          "odoo_tag": "Damaged / Defective Item",
+          "decision": "Disputed",
+          "status": "Returned",
+          "platform": "Shopee",
+          "grade": "",
+          "remarks": "Broken TEC"
+        }
+      ],
+      "case_decision": {
+        "confirmed": true
+      },
+      "new_stock_destination": "MNL/Stock",
+      "odoo_results": null,
+      "odoo_checkpoint": {
+        "order_id": "261108PBKMAX0V",
+        "ticket_title": "261108PBKMAX0V - MLE00170_1",
+        "ticket_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3767",
+        "product_sku": "MLE00170",
+        "tags": [
+          "Damaged / Defective Item"
+        ],
+        "platform": "Shopee",
+        "new_stock_destination": "MNL/Stock",
+        "customer": "ECOMMERCE, SHOPEE",
+        "returns": [],
+        "next_return_index": 1,
+        "resume_safe": true,
+        "setup_complete": true,
+        "stage": "inventory_pending",
+        "pending_return": {
+          "validation_boundary_version": 2,
+          "return_index": 1,
+          "decision": "Disputed",
+          "classification": "Defective",
+          "status": "Returned",
+          "items": [
+            {
+              "sku": "MLE00170",
+              "quantity": 1
+            }
+          ]
+        }
+      },
+      "lark_results": [],
+      "transfer_display": "Return pending - ticket saved",
+      "status_text": "Creating Return #1: MLE00170_1 | Defective | Disputed",
+      "last_error": "Sales Order 261108PBKMAX0V could not be selected from Odoo's suggestions (it may show 'No Record'). No stock Return was created.\n\nOdoo Helpdesk ticket already saved: 261108PBKMAX0V - MLE00170_1\nCheck the Sales Order suggestion and Odoo's Return/More action. Delivery to Return may be blank. Once ready, click Retry Odoo Return & Continue. The existing Helpdesk ticket will be reused."
+    },
+    "31f87461631f405ebf64e8c9bb6b8141": {
+      "scan_id": "31f87461631f405ebf64e8c9bb6b8141",
+      "created_at": "2026-11-24T09:18:43+08:00",
+      "updated_at": "2026-11-24T09:19:18+08:00",
+      "workflow_state": "lark_pending",
+      "platform": "Shopee",
+      "search_by": "Tracking Number",
+      "search_input": "PH2662114729507",
+      "order_id": "261116EVPWFJ8V",
+      "return_case": {
+        "order_id": "261116EVPWFJ8V",
+        "request_id": "2611170HN6F0JAA",
+        "refund_text": "₱636.00",
+        "refund_value": 636.0,
+        "tracking_number": "PH2662114729507",
+        "tracking_numbers": [
+          "PH2662114729507"
+        ],
+        "source_href": "/portal/sale/return/248606881204554",
+        "source_url": "https://seller.shopee.ph/portal/sale/return/248606881204554",
+        "order_href": "",
+        "order_url": "",
+        "return_href": "/portal/sale/return/248606881204554",
+        "return_url": "https://seller.shopee.ph/portal/sale/return/248606881204554",
+        "product_names": [
+          "Polymaker Panchroma PLA Matte 3D Printer Filament 1.75mm 1kg"
+        ],
+        "search_query": "PH2662114729507",
+        "search_by": "Tracking Number",
+        "platform": "Shopee"
+      },
+      "items": [
+        {
+          "sku": "MLE06697",
+          "quantity": 1,
+          "unit_price": 749,
+          "amount": 749.0,
+          "classification": "New",
+          "odoo_tag": "Change of Mind (Sealed)",
+          "decision": "Refunded",
+          "status": "Returned",
+          "platform": "Shopee",
+          "grade": "",
+          "remarks": "change of mind",
+          "received_item": "",
+          "wrong_item_status": ""
+        }
+      ],
+      "case_decision": {
+        "confirmed": true
+      },
+      "new_stock_destination": "MNL/Stock",
+      "odoo_results": {
+        "order_id": "261116EVPWFJ8V",
+        "ticket_title": "261116EVPWFJ8V - MLE06697_1",
+        "ticket_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3879",
+        "product_sku": "MLE06697",
+        "tags": [
+          "Change of Mind (Sealed)"
+        ],
+        "platform": "Shopee",
+        "new_stock_destination": "MNL/Stock",
+        "customer": "ECOMMERCE, SHOPEE",
+        "returns": [
+          {
+            "return_index": 1,
+            "decision": "Refunded",
+            "classification": "New",
+            "status": "Returned",
+            "items": [
+              {
+                "sku": "MLE06697",
+                "quantity": 1
+              }
+            ],
+            "destination_location": "MNL/Stock",
+            "qc_result": null,
+            "transfer_id": "TC/IN/12692",
+            "transfer_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3879/stock.picking/816705",
+            "validated": false,
+            "validation_pending": true,
+            "warehouse_approval_requested": true,
+            "warehouse_todo_created": false,
+            "warehouse_handoff_signal": "grant_approval",
+            "warehouse_handoff_activity_title": "Grant Approval",
+            "warehouse_handoff_activity_assignee": "Romelle Fajardo",
+            "warehouse_handoff_complete": true,
+            "stock_state": "not_checked"
+          }
+        ],
+        "next_return_index": null,
+        "resume_safe": false,
+        "setup_complete": true,
+        "stage": "returns_complete",
+        "pending_warehouse_approval_transfer_ids": [
+          "TC/IN/12692"
+        ]
+      },
+      "odoo_checkpoint": null,
+      "lark_results": [],
+      "normal_lark_results": [
+        {
+          "order_id": "261116EVPWFJ8V",
+          "sku": "MLE06697_1",
+          "quantity": 1,
+          "value": 636.0,
+          "classification": "New",
+          "status": "Returned",
+          "decision": "Refunded",
+          "platform": "Shopee",
+          "transfer_id": "TC/IN/12692",
+          "transfer_link": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3879/stock.picking/816705",
+          "remarks": "MLE06697: change of mind",
+          "grade": "",
+          "prefilled_url": "https://kjx72am2njb.sg.larksuite.com/share/base/form/shrlgCvlgAlYpqw3TAThRikY3ig?prefill_Order%20ID=261116EVPWFJ8V&prefill_SKU=MLE06697_1&prefill_QTY=1&prefill_Value=636.0&prefill_Classification=New&prefill_Status=Returned&prefill_Decision=Refunded&prefill_Platform=Shopee&prefill_Transfer%20ID=TC%2FIN%2F12692&prefill_Transfer%20Link=https%3A%2F%2Fmakerlab.odoo.com%2Fodoo%2Fhelpdesk%2F3%2Ftickets%2F3879%2Fstock.picking%2F816705&prefill_Remarks=MLE06697%3A%20change%20of%20mind",
+          "submitted": true,
+          "filing_type": "odoo_transfer",
+          "transfer_index": 1,
+          "value_source": "Return/refund value",
+          "items": [
+            {
+              "sku": "MLE06697",
+              "quantity": 1
+            }
+          ],
+          "item_count": 1,
+          "route_key": "normal:314e19f3db4115791f1794168d1358f7bda3be07fc1ea58192a3370c51aacfb2"
+        }
+      ],
+      "wrong_item_lark_results": [],
+      "transfer_display": "TC/IN/12692",
+      "status_text": "Lark return submitted successfully for MLE06697_1.",
+      "last_error": ""
+    }
+  }
+}

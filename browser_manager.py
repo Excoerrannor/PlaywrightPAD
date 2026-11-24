@@ -16,7 +16,7 @@ SHOPEE_RETURN_LIST_URL = (
 )
 LAZADA_RETURN_LIST_URL = (
     "https://sellercenter.lazada.com.ph/apps/order/reverse"
-    "?returnTab=merchant&tab=ReturnInProgress"
+    "?returnTab=merchant&tab=All"
 )
 TIKTOK_RETURN_LIST_URL = (
     "https://seller-ph.tiktok.com/order/return"

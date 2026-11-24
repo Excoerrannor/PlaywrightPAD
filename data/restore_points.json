@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "restore_points": {
+    "7a9e72e42a3649debdd164fd5d2a7f38": {
+      "scan_id": "7a9e72e42a3649debdd164fd5d2a7f38",
+      "created_at": "2026-11-17T16:11:58+08:00",
+      "updated_at": "2026-11-17T16:12:52+08:00",
+      "workflow_state": "odoo_return_pending",
+      "platform": "Shopee",
+      "search_by": "Tracking Number",
+      "search_input": "PH264200750050S",
+      "order_id": "2611137E4CT4BH",
+      "return_case": {
+        "order_id": "2611137E4CT4BH",
+        "request_id": "2611140A3J4DFCE",
+        "refund_text": "₱818.00",
+        "refund_value": 818.0,
+        "tracking_number": "PH264200750050S",
+        "tracking_numbers": [
+          "PH264200750050S"
+        ],
+        "source_href": "/portal/sale/return/248347427224974",
+        "source_url": "https://seller.shopee.ph/portal/sale/return/248347427224974",
+        "order_href": "",
+        "order_url": "",
+        "return_href": "/portal/sale/return/248347427224974",
+        "return_url": "https://seller.shopee.ph/portal/sale/return/248347427224974",
+        "product_names": [
+          "Makerlab ESP32 Basic Starter Kit WiFi IOT Development Learning Kit with PDF Projects and Code"
+        ],
+        "search_query": "PH264200750050S",
+        "search_by": "Tracking Number",
+        "platform": "Shopee"
+      },
+      "items": [
+        {
+          "sku": "MLE04758",
+          "quantity": 1,
+          "unit_price": 909,
+          "amount": 909.0,
+          "classification": "Defective",
+          "odoo_tag": "Damaged / Defective Item",
+          "decision": "Refunded",
+          "status": "Returned",
+          "platform": "Shopee",
+          "grade": "",
+          "remarks": "No damge not working"
+        }
+      ],
+      "case_decision": {
+        "confirmed": true
+      },
+      "new_stock_destination": "MNL/Stock",
+      "odoo_results": null,
+      "odoo_checkpoint": {
+        "order_id": "2611137E4CT4BH",
+        "ticket_title": "2611137E4CT4BH - MLE04758_1",
+        "ticket_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3742",
+        "product_sku": "MLE04758",
+        "tags": [
+          "Damaged / Defective Item"
+        ],
+        "platform": "Shopee",
+        "new_stock_destination": "MNL/Stock",
+        "customer": "ECOMMERCE, SHOPEE",
+        "returns": [],
+        "next_return_index": 1,
+        "resume_safe": true,
+        "setup_complete": true,
+        "stage": "inventory_pending",
+        "pending_return": {
+          "validation_boundary_version": 2,
+          "return_index": 1,
+          "decision": "Refunded",
+          "classification": "Defective",
+          "status": "Returned",
+          "items": [
+            {
+              "sku": "MLE04758",
+              "quantity": 1
+            }
+          ]
+        }
+      },
+      "lark_results": [],
+      "transfer_display": "Return pending - ticket saved",
+      "status_text": "Creating Return #1: MLE04758_1 | Defective | Refunded",
+      "last_error": "Sales Order 2611137E4CT4BH could not be selected from Odoo's suggestions (it may show 'No Record'). No stock Return was created.\n\nOdoo Helpdesk ticket already saved: 2611137E4CT4BH - MLE04758_1\nCheck the Sales Order suggestion and Odoo's Return/More action. Delivery to Return may be blank. Once ready, click Retry Odoo Return & Continue. The existing Helpdesk ticket will be reused."
+    },
+    "7b929f3e849d4cfc8117643c550740af": {
+      "scan_id": "7b929f3e849d4cfc8117643c550740af",
+      "created_at": "2026-11-18T17:16:43+08:00",
+      "updated_at": "2026-11-18T17:17:39+08:00",
+      "workflow_state": "odoo_return_pending",
+      "platform": "Shopee",
+      "search_by": "Tracking Number",
+      "search_input": "PH265302817034O",
+      "order_id": "261108PBKMAX0V",
+      "return_case": {
+        "order_id": "261108PBKMAX0V",
+        "request_id": "26111205KY8V6F3",
+        "refund_text": "₱469.00",
+        "refund_value": 469.0,
+        "tracking_number": "PH265302817034O",
+        "tracking_numbers": [
+          "PH265302817034O"
+        ],
+        "source_href": "/portal/sale/return/248193249286627",
+        "source_url": "https://seller.shopee.ph/portal/sale/return/248193249286627",
+        "order_href": "",
+        "order_url": "",
+        "return_href": "/portal/sale/return/248193249286627",
+        "return_url": "https://seller.shopee.ph/portal/sale/return/248193249286627",
+        "product_names": [
+          "Thermoelectric TEC12706 TEC-12706 Peltier Cooling System Heatsink Kit Air Cooled & Liquid Cooled"
+        ],
+        "search_query": "PH265302817034O",
+        "search_by": "Tracking Number",
+        "platform": "Shopee"
+      },
+      "items": [
+        {
+          "sku": "MLE00170",
+          "quantity": 1,
+          "unit_price": 469,
+          "amount": 469.0,
+          "classification": "Defective",
+          "odoo_tag": "Damaged / Defective Item",
+          "decision": "Disputed",
+          "status": "Returned",
+          "platform": "Shopee",
+          "grade": "",
+          "remarks": "Broken TEC"
+        }
+      ],
+      "case_decision": {
+        "confirmed": true
+      },
+      "new_stock_destination": "MNL/Stock",
+      "odoo_results": null,
+      "odoo_checkpoint": {
+        "order_id": "261108PBKMAX0V",
+        "ticket_title": "261108PBKMAX0V - MLE00170_1",
+        "ticket_url": "https://makerlab.odoo.com/odoo/helpdesk/3/tickets/3767",
+        "product_sku": "MLE00170",
+        "tags": [
+          "Damaged / Defective Item"
+        ],
+        "platform": "Shopee",
+        "new_stock_destination": "MNL/Stock",
+        "customer": "ECOMMERCE, SHOPEE",
+        "returns": [],
+        "next_return_index": 1,
+        "resume_safe": true,
+        "setup_complete": true,
+        "stage": "inventory_pending",
+        "pending_return": {
+          "validation_boundary_version": 2,
+          "return_index": 1,
+          "decision": "Disputed",
+          "classification": "Defective",
+          "status": "Returned",
+          "items": [
+            {
+              "sku": "MLE00170",
+              "quantity": 1
+            }
+          ]
+        }
+      },
+      "lark_results": [],
+      "transfer_display": "Return pending - ticket saved",
+      "status_text": "Creating Return #1: MLE00170_1 | Defective | Disputed",
+      "last_error": "Sales Order 261108PBKMAX0V could not be selected from Odoo's suggestions (it may show 'No Record'). No stock Return was created.\n\nOdoo Helpdesk ticket already saved: 261108PBKMAX0V - MLE00170_1\nCheck the Sales Order suggestion and Odoo's Return/More action. Delivery to Return may be blank. Once ready, click Retry Odoo Return & Continue. The existing Helpdesk ticket will be reused."
+    }
+  }
+}
